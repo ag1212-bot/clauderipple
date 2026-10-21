@@ -2843,6 +2843,20 @@ function isKeyBasedProvider(provider) {
  */
 const HEADERS_KEY_ID = "default";
 
+/** A header that carries a key, in whatever case a config or a form spelled it. */
+const AUTH_HEADER = /^(authorization|x-api-key)$/i;
+
+/** The name a headers object actually stores its auth header under ("Authorization", "x-api-key"), or "". */
+function authHeaderName(headers) {
+  return Object.keys(headers || {}).find((header) => AUTH_HEADER.test(header) && typeof headers[header] === "string" && headers[header].trim()) || "";
+}
+
+/** A header's value whatever case it was saved in; a config can hold "Authorization" where a form asks for "authorization". */
+function headerValueOf(headers, name) {
+  const found = Object.keys(headers || {}).find((header) => header.toLowerCase() === name);
+  return found ? headers[found] : undefined;
+}
+
 /**
  * A provider's keys as the pool reads them. `credentials` is the saved shape; a provider that has
  * only the old `headers.authorization` shows that one as key 1 and is migrated to `credentials` on
@@ -2866,6 +2880,18 @@ function keyValueOf(text) {
   return String(text || "").trim().replace(/^bearer\s+/i, "").replace(/\s+/g, "");
 }
 
+/** A pasted key's characters that cannot travel in a header: what the add-key dialog warns about. */
+function keyHasSpaces(text) {
+  return /\s/.test(String(text || "").trim().replace(/^bearer\s+/i, ""));
+}
+
+/** The router's key-character refusal in the words this screen already has for it. */
+function keyErrorMessage(error) {
+  const raw = String((error && error.message) || "");
+  if (/HTTP header|whitespace/i.test(raw)) return t("keys.spaces");
+  return raw;
+}
+
 /**
  * Save a new list of keys onto the provider, without ever handling a stored key's value.
  *
@@ -2880,12 +2906,14 @@ async function saveProviderKeys(name, change) {
   if (!saved) throw new Error(t("providers.noSelection"));
   const stored = Array.isArray(saved.credentials) ? saved.credentials.filter((entry) => entry && typeof entry.id === "string") : [];
   if (!stored.length) {
-    // The provider still holds one key in `headers`; it becomes key 1 on the first save here.
+    // The provider still holds one key in `headers`; it becomes the credential the router already
+    // calls "default" on its first save here, so the pool's health for that key survives the move.
+    // The auth header is matched in any case: a hand-edited config can spell it "Authorization".
     const headers = saved.headers || {};
-    const card = ["authorization", "x-api-key"].find((header) => typeof headers[header] === "string" && headers[header].trim());
+    const card = authHeaderName(headers);
     if (card) {
-      stored.push({ id: "key-1", label: t("keys.legacyLabel"), headers: { ...headers } });
-      const kept = Object.fromEntries(Object.entries(headers).filter(([header]) => !/^(authorization|x-api-key)$/i.test(header)));
+      stored.push({ id: HEADERS_KEY_ID, label: t("keys.legacyLabel"), headers: { ...headers } });
+      const kept = Object.fromEntries(Object.entries(headers).filter(([header]) => !AUTH_HEADER.test(header)));
       if (Object.keys(kept).length) saved.headers = kept;
       else delete saved.headers;
     }
@@ -2893,7 +2921,7 @@ async function saveProviderKeys(name, change) {
   const byId = new Map(stored.map((entry) => [entry.id, entry]));
   // A credential is a complete header set (the router sends it instead of the provider's headers),
   // so a new key takes the provider's other headers with it.
-  const sharedHeaders = Object.fromEntries(Object.entries(saved.headers || {}).filter(([header]) => !/^(authorization|x-api-key)$/i.test(header)));
+  const sharedHeaders = Object.fromEntries(Object.entries(saved.headers || {}).filter(([header]) => !AUTH_HEADER.test(header)));
   const credentials = change(byId, stored, sharedHeaders).map((entry) => ({
     ...entry,
     id: entry.id,
@@ -2928,7 +2956,7 @@ function openAddKeyDialog(name, options) {
   const save = el("button", { class: "btn", type: "button", "data-default-action": "", text: t("keys.add") });
   const check = () => {
     const key = keyValueOf(keyInput.value);
-    const issue = key && /\s/.test(keyInput.value.trim().replace(/^bearer\s+/i, "")) ? t("keys.spaces") : "";
+    const issue = key && keyHasSpaces(keyInput.value) ? t("keys.spaces") : "";
     problem.textContent = issue;
     problem.hidden = !issue;
     save.disabled = !key || Boolean(issue);
@@ -2944,19 +2972,21 @@ function openAddKeyDialog(name, options) {
       await api(`/api/provider-keys?provider=${encodeURIComponent(name)}`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ label, key }),
+        // The router refuses an empty label, and a blank name is a normal thing to leave alone:
+        // the field is not sent at all, so the key is saved with the default name instead.
+        body: JSON.stringify({ key, ...(label ? { label } : {}) }),
       });
       closeModal();
       await afterKeyAdded(name, options);
     } catch (error) {
       save.disabled = false;
-      toast(t("common.saveFailed"), true, error.message);
+      toast(t("common.saveFailed"), true, keyErrorMessage(error));
     }
   });
   showModal(el("div", {}, [
     el("h1", { id: "modal-title", text: t("keys.addTitle") }),
     hint(t("keys.addHelp")),
-    el("label", { class: "form-field" }, [el("span", { text: t("keys.label") }), labelInput]),
+    el("label", { class: "form-field" }, [el("span", { text: t("keys.label") }), labelInput, el("small", { text: t("keys.labelOptional") })]),
     el("div", { class: "form-field key-field" }, [
       el("span", { text: t("keys.key") }),
       el("div", { class: "key-control" }, [keyInput, showKey]),
@@ -3053,7 +3083,7 @@ function moveProviderKey(name, row, rows, delta) {
  * A stored key is shown as "저장한 키를 쓰고 있습니다" and nothing more — the router keeps the value,
  * and this screen never puts it back on the page.
  */
-const KEY_STATES = new Set(["in-use", "standby", "cooling", "paused", "quarantined"]);
+const KEY_STATES = new Set(["in-use", "standby", "cooling", "paused", "quarantined", "unknown"]);
 
 /** "5시간 33% · 주간 86% · 월간 55%" — the same line the ChatGPT cards use for a quota. */
 function keyQuotaText(windows) {
@@ -3077,6 +3107,9 @@ function keyStateBadge(account) {
   if (state === "quarantined") return el("span", { class: "badge bad", text: t("keys.stateQuarantined") });
   if (state === "cooling") return el("span", { class: "badge warn", text: t("keys.stateCooling", { duration: durationText(cooldown) }) });
   if (state === "in-use") return el("span", { class: "badge ok", text: t("providers.chatgptInUse") });
+  // The router says "unknown" for a key nothing has read yet. That is not standby: it has no
+  // reading at all, and saying "대기" would promise a slot the router never confirmed.
+  if (state === "unknown") return el("span", { class: "badge", text: t("keys.stateUnknown") });
   return el("span", { class: "badge", text: t("providers.chatgptStandby") });
 }
 
@@ -3856,8 +3889,12 @@ function openProviderForm(options) {
   const showKey = el("button", { class: "eye-button", type: "button", text: t("common.show") });
   showKey.addEventListener("click", () => { const show = keyInput.type === "password"; keyInput.type = show ? "text" : "password"; showKey.textContent = show ? t("common.hide") : t("common.show"); });
   const currentHeaders = (existing && existing.headers) || {};
-  const headerKind = preset ? preset.authHeader : (isOpenAi || Object.keys(currentHeaders).some((key) => key.toLowerCase() === "authorization") ? "authorization-bearer" : "x-api-key");
-  const existingKey = headerKind === "authorization-bearer" ? String(currentHeaders.authorization || "").replace(/^Bearer\s+/i, "") : currentHeaders["x-api-key"] || "";
+  // The saved auth header is found in any case: a config may spell it "Authorization" while the
+  // form writes "authorization", and an exact-case read left `existingKey` empty — saving the form
+  // then wrote an empty `headers` over the only key this provider had.
+  const savedAuthHeader = authHeaderName(currentHeaders);
+  const headerKind = preset ? preset.authHeader : (isOpenAi || (savedAuthHeader && savedAuthHeader.toLowerCase() === "authorization") ? "authorization-bearer" : "x-api-key");
+  const existingKey = headerKind === "authorization-bearer" ? String(headerValueOf(currentHeaders, "authorization") || "").replace(/^Bearer\s+/i, "") : headerValueOf(currentHeaders, "x-api-key") || "";
   if (existingKey) keyInput.placeholder = t("providers.keySaved");
   const urlInput = el("input", { value: (existing && existing.url) || (preset && preset.anthropicBaseUrl) || "", placeholder: "https://" });
   const wireSelect = el("select", {}, [selectOption("chat", "Chat Completions"), selectOption("responses", "Responses")]);
@@ -3985,8 +4022,9 @@ function openProviderForm(options) {
       if (kind === "authorization-bearer") headers.authorization = `Bearer ${key}`;
       else headers["x-api-key"] = key;
     } else if (existingKey) {
-      if (kind === "authorization-bearer") headers.authorization = currentHeaders.authorization;
-      else headers["x-api-key"] = currentHeaders["x-api-key"];
+      // Put the saved key back under the header name it is stored with, whatever its case.
+      const savedName = Object.keys(currentHeaders).find((header) => header.toLowerCase() === (kind === "authorization-bearer" ? "authorization" : "x-api-key"));
+      if (savedName) headers[savedName] = currentHeaders[savedName];
     }
     const rawHeaders = advancedContent._extraHeaders && advancedContent._extraHeaders.value;
     for (const line of String(rawHeaders || "").split("\n")) {
@@ -4001,6 +4039,11 @@ function openProviderForm(options) {
       return { type: "chatgpt", auth: chat.auth.value, defaultEffort: chat.effort.value, identity: chat.identity.checked, limits: chat.limits.checked, ...(chat.append.value.trim() ? { instructionsAppend: chat.append.value.trim() } : {}) };
     }
     const prompt = advancedContent._prompt;
+    const draftHeaders = readHeaders();
+    // Nothing in this form clears a key: with no credentials the provider's one key lives in
+    // `headers`, an empty auth header here means "unchanged", and a save must never blank it.
+    const savesHeaders = !(Array.isArray(existing && existing.credentials) && existing.credentials.length);
+    if (existing && savesHeaders && savedAuthHeader && !authHeaderName(draftHeaders)) draftHeaders[savedAuthHeader] = currentHeaders[savedAuthHeader];
     return {
       type: openAiNow() ? "openai-compatible" : "anthropic-compatible",
       url: urlInput.value.trim(),
@@ -4011,7 +4054,7 @@ function openProviderForm(options) {
       // preset rather than leaving the user to discover the bill.
       ...(preset && preset.sessionHeader ? { sessionHeader: preset.sessionHeader } : {}),
       ...(openAiNow() ? { wire: wireNow(), caps: { effortLevels: (preset && preset.effortLevels) || [], reasoning: preset && preset.effortLevels && preset.effortLevels.length ? "effort" : "none" } } : {}),
-      ...(Object.keys(readHeaders()).length ? { headers: readHeaders() } : {}),
+      ...(Object.keys(draftHeaders).length ? { headers: draftHeaders } : {}),
     };
   }
   function probeDraft() {
@@ -4105,12 +4148,15 @@ function openProviderForm(options) {
       const twin = providerByBaseUrl((currentConfig && currentConfig.providers) || {}, provider.url);
       if (twin && !typedKey) { toast(t("providers.existingNeedsKey", { name: twin[0] }), true); return; }
       if (twin && typedKey) {
+        // Only the key travels: the router drops the spaces itself, without saying so, which turned
+        // a key pasted with its label into a silent wrong one. Refuse it here like the add-key dialog.
+        if (keyHasSpaces(keyInput.value)) { toast(t("keys.spaces"), true); return; }
         saveButton.disabled = true;
         try {
           await api(`/api/provider-keys?provider=${encodeURIComponent(twin[0])}`, {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ label: typedName, key: typedKey }),
+            body: JSON.stringify({ key: typedKey, ...(typedName ? { label: typedName } : {}) }),
           });
           closeModal();
           slotsLoaded = false;
@@ -4118,7 +4164,7 @@ function openProviderForm(options) {
           await afterKeyAdded(twin[0], { notice: t("providers.addedToExisting", { name: twin[0] }) });
         } catch (error) {
           saveButton.disabled = false;
-          toast(t("common.saveFailed"), true, error.message);
+          toast(t("common.saveFailed"), true, keyErrorMessage(error));
         }
         return;
       }
