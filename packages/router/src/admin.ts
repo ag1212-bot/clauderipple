@@ -12,6 +12,10 @@
 //   POST /api/google-login/code  paste the code when no loopback callback could be used
 //   GET  /api/google-accounts?provider=   signed-in Google accounts, rotation state (no tokens)
 //   PATCH/DELETE /api/google-accounts/:id rename, pause/resume, clear a cooldown; remove
+//   GET  /api/provider-keys?provider=     any key-based provider's keys: state, cooldown, windows, credit
+//   POST /api/provider-keys?provider=     add a key ({label?, key}); migrates a headers-only key first
+//   PATCH/DELETE /api/provider-keys/:id?provider=  rename, pause/resume, clear a cooldown; remove
+//   (/api/opencode-accounts is the GET/PATCH/DELETE alias this endpoint had before 2026-10-21.)
 //   GET  /api/update    whether a newer version is published, and how this copy was installed
 //   POST /api/update    start `clauderipple update` in the background (it restarts this router)
 //   GET  /api/power     lid-closed awake + hotspot failover state (power.ts)
@@ -30,7 +34,7 @@ import http from "node:http";
 import { execFile, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import type { Config, Provider, ProviderModel } from "./config.ts";
-import { adminPort, headerValueProblem, homeDir, searchProviderFor, ssidProblem, validate } from "./config.ts";
+import { adminPort, authConventionOf, headerValueProblem, homeDir, isKeyProvider, searchProviderFor, ssidProblem, validate } from "./config.ts";
 export { adminPort } from "./config.ts";
 import { generatedAgents } from "./agents.ts";
 import { isJudgeOnlyModel } from "./model-policy.ts";
@@ -66,8 +70,9 @@ import { readChatGptAccounts, removeChatGptAccount, summarize as summarizeChatGp
 import { exhaustedForMs, IMAGE_ASPECTS, IMAGE_BACKGROUNDS, IMAGE_FORMATS, type ChatGptAccountStatus, type ImageRequest, type ImageResult } from "./providers/chatgpt/index.ts";
 import type { GoogleAccountStatus } from "./providers/google/index.ts";
 import { googleWindowsFromGroups, type QuotaGroup } from "./providers/google/usage.ts";
-import { isOpenCodeGo, type OpenCodeAccountState, type OpenCodeLimit } from "./providers/opencode-usage.ts";
-import type { CreditBalance, CreditLimit } from "./providers/credit-balance.ts";
+import { isOpenCodeGo, type OpenCodeLimit } from "./providers/opencode-usage.ts";
+import type { CreditBalance } from "./providers/credit-balance.ts";
+import type { CreditKeyLimit, ProviderKeyState } from "./proxy.ts";
 import type { GrokWindow } from "./providers/grok/usage.ts";
 import { ANTIGRAVITY_WARNING, staticAntigravityModels } from "./providers/google/antigravity.ts";
 import { readGoogleAccounts, removeGoogleAccount, summarize as summarizeGoogleAccount, updateGoogleAccount } from "./providers/google/accounts.ts";
@@ -183,18 +188,18 @@ export type AdminDeps = {
   /** The Claude models the signed-in account can use (`GET /v1/models`); null until one answer. Absent in tests. */
   claudeModels?: () => Promise<ClaudeModel[] | null>;
   /**
-   * A credit-selling provider's remaining balance, for the status bar's limits row (`/api/limits`),
-   * or null when it has none. Absent in tests.
+   * A credit-selling provider's remaining balance per key, for the status bar's limits row
+   * (`/api/limits`). Empty when it sells no credit. Absent in tests.
    */
-  creditBalance?: (name: string) => Promise<CreditLimit | null>;
+  creditBalance?: (name: string) => Promise<CreditKeyLimit[]>;
   /** An OpenCode Go provider's usage per key, for the status bar's limits row (`/api/limits`). Absent in tests. */
   opencodeUsage?: (name: string) => Promise<OpenCodeLimit[]>;
   /**
-   * Each OpenCode Go key as an account card for `GET /api/opencode-accounts` (state, cooldown,
-   * windows; ids and labels only). Absent in tests.
+   * Each key of any key-based provider as an account card for `GET /api/provider-keys` (state,
+   * cooldown, windows, credit; ids and labels only). Absent in tests.
    */
-  opencodeAccounts?: (name: string) => Promise<OpenCodeAccountState[]>;
-  /** Put one provider credential back into rotation now (`PATCH /api/opencode-accounts/:id`). */
+  providerKeys?: (name: string) => Promise<ProviderKeyState[]>;
+  /** Put one provider credential back into rotation now (`PATCH /api/provider-keys/:id`). */
   credentialClear?: (provider: string, id: string) => void;
   /** A Grok provider's usage pool, for the status bar's limits row (`/api/limits`). Absent in tests. */
   grokUsage?: (name: string) => Promise<GrokWindow[]>;
@@ -357,48 +362,65 @@ async function googleLimitAccounts(deps: AdminDeps, name: string): Promise<Limit
 }
 
 /**
- * The OpenCode Go provider an account-card request names, or null when there is none. The query
- * `provider` picks one; absent, the first OpenCode Go provider in config order is used, the same
- * fallback `/api/chatgpt-accounts` uses.
+ * The key-based provider a provider-keys request names, or null when there is none. The query
+ * `provider` picks one (openai-compatible or anthropic-compatible); absent, the first key-based
+ * provider in config order is used, the same fallback `/api/chatgpt-accounts` uses.
  */
-function opencodeProviderName(deps: AdminDeps, wanted: string | null): string | null {
+function keyProviderName(deps: AdminDeps, wanted: string | null): string | null {
   const providers = deps.config().providers;
   if (wanted) {
     const p = providers[wanted];
-    return p && p.type === "openai-compatible" && isOpenCodeGo(p) ? wanted : null;
+    return p && isKeyProvider(p) ? wanted : null;
   }
   for (const [name, p] of Object.entries(providers)) {
-    if (p.type === "openai-compatible" && isOpenCodeGo(p)) return name;
+    if (isKeyProvider(p)) return name;
   }
   return null;
 }
 
 /**
- * Rename, pause/resume or remove one key in a provider's `credentials`.
+ * The config file as it is on disk right now, or the reason it could not be read.
  *
- * The config is read again rather than reusing the in-memory copy, and written through the one
- * atomic save path, because the router picks a config file up by mtime: writing back a stale copy
- * would silently revert a save the user made from another screen while this request was running.
- * The result is validated with the same `validate` the GUI's save uses, so a bad edit is refused
- * rather than written.
- *
- * Removing the last key is allowed: the provider then has no `credentials` and falls back to its
- * single `headers` key, which is the state every provider starts in.
+ * Read again rather than reusing the in-memory copy, and written through the one atomic save path,
+ * because the router picks a config file up by mtime: writing back a stale copy would silently
+ * revert a save the user made from another screen while this request was running.
  */
-function changeOpencodeKey(
+function readConfigFile(deps: AdminDeps): Config | { error: string } {
+  try {
+    return JSON.parse(fs.readFileSync(deps.configFile, "utf8")) as Config;
+  } catch (e) {
+    return { error: `could not re-read config: ${errorText(e)}` };
+  }
+}
+
+function saveConfigFile(deps: AdminDeps, config: Config): { ok: true } | { error: string } {
+  const errors = validate(config);
+  if (errors.length > 0) return { error: errors[0]! };
+  writeConfigFile(deps.configFile, config);
+  return { ok: true };
+}
+
+/**
+ * Rename, pause/resume or remove one key in a key-based provider's `credentials`.
+ *
+ * The result is validated with the same `validate` the GUI's save uses, so a bad edit is refused
+ * rather than written. Removing the last key is allowed: the provider then has no `credentials` and
+ * falls back to its `headers` key, which is the state every provider starts in.
+ *
+ * Removing the migrated key of a provider that had only `headers` deliberately does **not** put that
+ * key back into `headers`: the operator asked for it to be gone, and restoring it would keep a
+ * deleted key in use. The provider is then unauthenticated, which is what its config says.
+ */
+function changeProviderKey(
   deps: AdminDeps,
   name: string,
   id: string,
   change: { label?: string; paused?: boolean; remove?: boolean },
 ): { ok: true } | { error: string } {
-  let current: Config;
-  try {
-    current = JSON.parse(fs.readFileSync(deps.configFile, "utf8")) as Config;
-  } catch (e) {
-    return { error: `could not re-read config: ${errorText(e)}` };
-  }
+  const current = readConfigFile(deps);
+  if ("error" in current) return current;
   const provider = current.providers[name];
-  if (!provider || provider.type !== "openai-compatible" || !isOpenCodeGo(provider) || !provider.credentials) return { error: "not-found" };
+  if (!provider || !isKeyProvider(provider) || !provider.credentials) return { error: "not-found" };
   const index = provider.credentials.findIndex((credential) => credential.id === id);
   if (index < 0) return { error: "not-found" };
   if (change.remove) {
@@ -414,27 +436,92 @@ function changeOpencodeKey(
       else delete credential.paused;
     }
   }
-  const errors = validate(current);
-  if (errors.length > 0) return { error: errors[0]! };
-  writeConfigFile(deps.configFile, current);
-  return { ok: true };
+  return saveConfigFile(deps, current);
 }
 
 /**
- * Whether a key id names a credential of this OpenCode Go provider, read from the config file the
- * same way `changeOpencodeKey` reads it. Clearing a cooldown touches no config, but it must still
- * answer an unknown id the way a rename does instead of reporting a success for a key nobody has.
+ * Whether a key id names a credential of this provider, read from the config file the same way
+ * `changeProviderKey` reads it. Clearing a cooldown touches no config, but it must still answer an
+ * unknown id the way a rename does instead of reporting a success for a key nobody has.
+ *
+ * A provider with no `credentials` has exactly one key, in `headers`, and the router calls it
+ * "default": that id exists for the pool even though the file does not spell it out, so a cooldown
+ * clear on it is honest. A rename or pause has nowhere to be written, and is refused by the caller.
  */
-function opencodeKeyKnown(deps: AdminDeps, name: string, id: string): "ok" | "not-found" | { error: string } {
-  let current: Config;
-  try {
-    current = JSON.parse(fs.readFileSync(deps.configFile, "utf8")) as Config;
-  } catch (e) {
-    return { error: `could not re-read config: ${errorText(e)}` };
-  }
+function providerKeyKnown(deps: AdminDeps, name: string, id: string): "ok" | "not-found" | { error: string } {
+  const current = readConfigFile(deps);
+  if ("error" in current) return current;
   const provider = current.providers[name];
-  if (!provider || provider.type !== "openai-compatible" || !isOpenCodeGo(provider) || !provider.credentials) return "not-found";
-  return provider.credentials.some((credential) => credential.id === id) ? "ok" : "not-found";
+  if (!provider || !isKeyProvider(provider)) return "not-found";
+  if (provider.credentials?.some((credential) => credential.id === id)) return "ok";
+  if (!provider.credentials?.length && id === HEADERS_KEY_ID) return "ok";
+  return "not-found";
+}
+
+/** The id the router gives a provider's one key when it lives in `headers` (proxy `credentialsOf`). */
+const HEADERS_KEY_ID = "default";
+
+/**
+ * Append one credential to a key-based provider from `{label, key}`.
+ *
+ * A provider that kept its only key in `headers` is migrated first: that key becomes
+ * `credentials[0]` under the id the router already used for it ("default"), so its health and
+ * cooldown history survive, and its auth header leaves `headers` (the other headers stay — they are
+ * sent with every key). A provider that already has credentials just gains one.
+ *
+ * The auth header is the convention the provider already uses (config.ts `authConventionOf`), so a
+ * new key does not go out under a header its endpoint ignores. The key itself is never returned,
+ * logged, or put in an error message.
+ */
+function addProviderKey(
+  deps: AdminDeps,
+  name: string,
+  input: { label?: string; key: string },
+): { ok: true; id: string; migrated: boolean } | { error: string } {
+  const current = readConfigFile(deps);
+  if ("error" in current) return current;
+  const provider = current.providers[name];
+  if (!provider || !isKeyProvider(provider)) return { error: "not-found" };
+
+  const key = input.key.trim().replace(/^Bearer\s+/i, "");
+  if (!key) return { error: "the key is empty" };
+  // A header value is bytes: a key pasted with its label fails deep inside fetch with a message
+  // that says nothing about what the user did. The message those checks produce can quote the
+  // offending character, which would put part of the key in an answer, so this says the same thing
+  // without it — the key is never echoed, not even one character of it.
+  if (headerValueProblem(key) || /\s/.test(key)) {
+    return { error: "the key contains a character that cannot travel in an HTTP header (a space, a line break or a non-ASCII character) — paste the key on its own, without any label or surrounding text" };
+  }
+  if (input.label !== undefined && !input.label.trim()) return { error: "the label is empty" };
+
+  let migrated = false;
+  if (!provider.credentials?.length) {
+    // Migrate the headers-only key first, keeping the id the router already knows it by.
+    const headers = "headers" in provider ? provider.headers ?? {} : {};
+    const auth = ["authorization", "x-api-key"].find((header) => Object.keys(headers).some((key) => key.toLowerCase() === header));
+    if (auth) {
+      const actual = Object.keys(headers).find((key) => key.toLowerCase() === auth)!;
+      const kept = Object.fromEntries(Object.entries(headers).filter(([header]) => header !== actual));
+      provider.credentials = [{ id: HEADERS_KEY_ID, headers: { [actual]: headers[actual]! } }];
+      if (kept && Object.keys(kept).length > 0) (provider as { headers?: Record<string, string> }).headers = kept;
+      else delete (provider as { headers?: Record<string, string> }).headers;
+      migrated = true;
+    }
+  }
+
+  const convention = authConventionOf(provider);
+  const headers = convention === "x-api-key" ? { "x-api-key": key } : { authorization: `Bearer ${key}` };
+  // Ids are `key-<n>` with the first free n; "default" is reserved for the migrated headers key, so a
+  // new key never takes that id over and the old key's health stays its own.
+  const used = new Set((provider.credentials ?? []).map((credential) => credential.id));
+  let number = 1;
+  while (used.has(`key-${number}`)) number += 1;
+  const id = `key-${number}`;
+  provider.credentials = [...(provider.credentials ?? []), { id, ...(input.label?.trim() ? { label: input.label.trim() } : {}), headers }];
+
+  const saved = saveConfigFile(deps, current);
+  if ("error" in saved) return saved;
+  return { ok: true, id, migrated };
 }
 
 /**
@@ -447,10 +534,16 @@ async function buildLimits(deps: AdminDeps): Promise<{ providers: LimitsProvider
   for (const [name, p] of Object.entries(deps.config().providers)) {
     if (p.limits === false) continue;
     // A provider that sells prepaid credit reports that instead of quota windows, whichever wire it
-    // speaks (sail on OpenRouter's anthropic-compatible one, an OpenRouter key on either).
-    const credit = deps.creditBalance ? await deps.creditBalance(name) : null;
-    if (credit) {
-      providers.push({ provider: name, type: "credit", title: name, accounts: [{ account: 0, windows: [], at: credit.at, credit: credit.credit }] });
+    // speaks (sail on OpenRouter's anthropic-compatible one, an OpenRouter key on either) — one row
+    // per key, because each key is a separate balance.
+    const credits = deps.creditBalance ? await deps.creditBalance(name) : [];
+    if (credits.length > 0) {
+      providers.push({
+        provider: name, type: "credit", title: name,
+        accounts: credits.map((row, index) => ({
+          account: index, ...(row.label ? { label: row.label } : {}), windows: [], at: row.at, credit: row.credit,
+        })),
+      });
       continue;
     }
     if (p.type === "anthropic" && p.auth === "claude-code") {
@@ -2107,39 +2200,90 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
         sendJson(res, 200, await buildLimits(deps));
         return;
       }
-      // One OpenCode Go provider's keys as account cards (state, cooldown, windows). Ids and labels
-      // only: the headers that carry a key are never rendered or logged here. (They are still part
-      // of the provider config this router serves, as they always have been — `GET /api/config`.)
-      if (pathname === "/api/opencode-accounts" && method === "GET") {
+      // Every key-based provider's keys as account cards (state, cooldown, windows, balance). Ids and
+      // labels only: the headers that carry a key are never rendered or logged here. (They are still
+      // part of the provider config this router serves, as they always have been — `GET /api/config`.)
+      // `/api/opencode-accounts` is the same endpoint under the name it had before 2026-10-21.
+      if ((pathname === "/api/provider-keys" || pathname === "/api/opencode-accounts") && method === "GET") {
         const wanted = new URL(url, "http://127.0.0.1").searchParams.get("provider");
-        const name = opencodeProviderName(deps, wanted);
+        const name = keyProviderName(deps, wanted);
         if (!name) {
-          sendJson(res, 404, { error: "no OpenCode Go provider by that name" });
+          sendJson(res, 404, { error: "no key-based provider by that name" });
           return;
         }
-        sendJson(res, 200, { provider: name, accounts: (await deps.opencodeAccounts?.(name)) ?? [] });
+        const provider = deps.config().providers[name]!;
+        sendJson(res, 200, {
+          provider: name,
+          type: provider.type,
+          accounts: (await deps.providerKeys?.(name)) ?? [],
+        });
         return;
       }
-      if (pathname.startsWith("/api/opencode-accounts/") && (method === "PATCH" || method === "DELETE")) {
+      if (pathname === "/api/provider-keys" && method === "POST") {
+        // A mutation names its provider: with the query omitted the GET falls back to the first
+        // key-based provider, but writing a key into whichever provider happens to be first in the
+        // config is not a convenience — it is a key in the wrong place.
+        const wanted = new URL(url, "http://127.0.0.1").searchParams.get("provider");
+        const name = wanted ? keyProviderName(deps, wanted) : null;
+        if (!name) {
+          sendJson(res, 404, { error: "no key-based provider by that name" });
+          return;
+        }
+        let body: { label?: unknown; key?: unknown };
+        try {
+          body = JSON.parse((await readBody(req)).toString("utf8")) as typeof body;
+        } catch {
+          sendJson(res, 400, { error: "invalid JSON" });
+          return;
+        }
+        if (typeof body.key !== "string" || (body.label !== undefined && typeof body.label !== "string")) {
+          sendJson(res, 400, { error: "expected {label?: string, key: string}" });
+          return;
+        }
+        const result = addProviderKey(deps, name, {
+          key: body.key,
+          ...(typeof body.label === "string" ? { label: body.label } : {}),
+        });
+        if ("error" in result) {
+          sendJson(res, result.error === "not-found" ? 404 : 400, { error: result.error === "not-found" ? "no key-based provider by that name" : result.error });
+          return;
+        }
+        // The id only: the key itself is never echoed back, logged, or named in an error.
+        deps.log.info(`admin: added key ${result.id} to ${name}`);
+        sendJson(res, 201, { ok: true, provider: name, id: result.id, migrated: result.migrated });
+        return;
+      }
+      if ((pathname.startsWith("/api/provider-keys/") || pathname.startsWith("/api/opencode-accounts/")) && (method === "PATCH" || method === "DELETE")) {
+        const prefix = pathname.startsWith("/api/provider-keys/") ? "/api/provider-keys/" : "/api/opencode-accounts/";
         let id: string;
         try {
-          id = decodeURIComponent(pathname.slice("/api/opencode-accounts/".length));
+          id = decodeURIComponent(pathname.slice(prefix.length));
         } catch {
           sendJson(res, 400, { error: "invalid key id" });
           return;
         }
-        const name = opencodeProviderName(deps, new URL(url, "http://127.0.0.1").searchParams.get("provider"));
+        const wanted = new URL(url, "http://127.0.0.1").searchParams.get("provider");
+        const name = wanted ? keyProviderName(deps, wanted) : null;
         if (!name) {
-          sendJson(res, 404, { error: "no OpenCode Go provider by that name" });
+          sendJson(res, 404, { error: "no key-based provider by that name" });
           return;
         }
+        // A key-based provider (the name check above guarantees it) has exactly one key, in
+        // `headers`, until something is in `credentials`. That key has no credential entry to carry a
+        // label or a pause — but it exists in the pool as id "default", so a cooldown clear is honest.
+        const provider = deps.config().providers[name]!;
+        const headersOnly = isKeyProvider(provider) && !provider.credentials?.length;
         if (method === "DELETE") {
-          const result = changeOpencodeKey(deps, name, id, { remove: true });
+          if (headersOnly && id === HEADERS_KEY_ID) {
+            sendJson(res, 400, { error: "this provider keeps its only key in its headers; remove the provider instead" });
+            return;
+          }
+          const result = changeProviderKey(deps, name, id, { remove: true });
           if ("error" in result) {
             sendJson(res, result.error === "not-found" ? 404 : 400, { error: result.error === "not-found" ? "key not found" : result.error });
             return;
           }
-          deps.log.info(`admin: removed OpenCode Go key ${id} from ${name}`);
+          deps.log.info(`admin: removed key ${id} from ${name}`);
           sendJson(res, 200, { ok: true });
           return;
         }
@@ -2154,11 +2298,18 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
           sendJson(res, 400, { error: "expected {label?: non-empty string, paused?: boolean, clearCooldown?: true}" });
           return;
         }
+        // A headers-only key has no credential to carry a label or a pause; the contract says so
+        // rather than writing a `credentials` entry the pool did not ask for. Checked before anything
+        // is done, so a refused rename does not leave a cooldown already cleared.
+        if (headersOnly && (change.label !== undefined || change.paused !== undefined)) {
+          sendJson(res, 400, { error: "this provider keeps its only key in its headers; add a key first, which moves it into credentials" });
+          return;
+        }
         if (change.clearCooldown === true) {
           // Clearing touches the router's memory, not the file, so the id has to be checked here:
           // otherwise an unknown key answered 200 and the dashboard showed a cooldown cleared for a
           // key that does not exist.
-          const known = opencodeKeyKnown(deps, name, id);
+          const known = providerKeyKnown(deps, name, id);
           if (known !== "ok") {
             if (known === "not-found") sendJson(res, 404, { error: "key not found" });
             else sendJson(res, 400, { error: known.error });
@@ -2167,7 +2318,7 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
           deps.credentialClear?.(name, id);
         }
         if (change.label !== undefined || change.paused !== undefined) {
-          const result = changeOpencodeKey(deps, name, id, {
+          const result = changeProviderKey(deps, name, id, {
             ...(typeof change.label === "string" ? { label: change.label } : {}),
             ...(typeof change.paused === "boolean" ? { paused: change.paused } : {}),
           });
@@ -2176,7 +2327,7 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
             return;
           }
         }
-        deps.log.info(`admin: updated OpenCode Go key ${id} on ${name}`);
+        deps.log.info(`admin: updated key ${id} on ${name}`);
         sendJson(res, 200, { ok: true });
         return;
       }

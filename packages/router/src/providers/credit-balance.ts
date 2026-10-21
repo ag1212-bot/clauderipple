@@ -145,6 +145,12 @@ export class CreditBalances {
     return this.goodAt.get(name) ?? 0;
   }
 
+  /** How long an answer is trusted. Callers that park a key on an empty balance need to know when
+   * the next read — the one that could release it — is due. */
+  ttlMs(): number {
+    return this.opts.ttlMs ?? 5 * 60_000;
+  }
+
   private async fetchOne(name: string, vendor: CreditVendor, headers: Record<string, string>): Promise<CreditBalance | null> {
     const keep = () => this.last.get(name) ?? null;
     const get = (url: string) => (this.opts.fetch ?? fetch)(url, {

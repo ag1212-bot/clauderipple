@@ -45,7 +45,7 @@ async function withAdmin(
     chatgpt?: NonNullable<AdminDeps["chatgpt"]>;
     google?: NonNullable<AdminDeps["google"]>;
     opencodeUsage?: NonNullable<AdminDeps["opencodeUsage"]>;
-    opencodeAccounts?: NonNullable<AdminDeps["opencodeAccounts"]>;
+    providerKeys?: NonNullable<AdminDeps["providerKeys"]>;
     creditBalance?: NonNullable<AdminDeps["creditBalance"]>;
     credentialClear?: NonNullable<AdminDeps["credentialClear"]>;
     claudeUsage?: NonNullable<AdminDeps["claudeUsage"]>;
@@ -2537,8 +2537,8 @@ test("GET /api/limits reports a credit-selling provider as a credit row, and hon
     assert.deepEqual(body.providers[1]!.accounts[0]!.credit, { remaining_usd: 2.5, low: true });
   }, {
     creditBalance: async (name: string) => name === "sail"
-      ? { credit: { remaining_usd: 737.95, days_remaining: 12.3, low: false }, at: now }
-      : name === "or" ? { credit: { remaining_usd: 2.5, low: true }, at: now } : null,
+      ? [{ id: "default", credit: { remaining_usd: 737.95, days_remaining: 12.3, low: false }, at: now }]
+      : name === "or" ? [{ id: "default", credit: { remaining_usd: 2.5, low: true }, at: now }] : [],
   });
 });
 
@@ -2570,7 +2570,7 @@ test("GET /api/limits lists one OpenCode Go account per key, labelled when the k
   });
 });
 
-test("GET /api/opencode-accounts lists each key's state and windows, and never a header", async () => {
+test("GET /api/provider-keys lists each key's state and windows, and never a header", async () => {
   const now = Date.now();
   const cfg = makeCfg({ providers: {
     go: {
@@ -2582,20 +2582,24 @@ test("GET /api/opencode-accounts lists each key's state and windows, and never a
     },
   } });
   await withAdmin(cfg, async ({ port }) => {
-    const res = await fetch(`${base()}:${port}/api/opencode-accounts?provider=go`);
-    assert.equal(res.status, 200);
-    const text = await res.text();
-    assert.ok(!text.includes("test-key-1") && !text.includes("test-key-2"), "no header value is serialised");
-    assert.ok(!/authorization/i.test(text), "not even the header's name");
-    const body = JSON.parse(text) as { provider: string; accounts: { id: string; label?: string; state: string; at: number; windows: { kind: string; used_percent: number }[] }[] };
-    assert.equal(body.provider, "go");
-    assert.deepEqual(body.accounts.map((a) => [a.id, a.label, a.state]), [["k1", "Work", "in-use"], ["k2", undefined, "paused"]]);
-    assert.equal(body.accounts[0]!.windows[0]!.kind, "five_hour");
-    assert.equal(body.accounts[0]!.at, now);
-    // An unknown provider, or a provider that is not OpenCode Go, is a 404 rather than an empty list.
-    assert.equal((await fetch(`${base()}:${port}/api/opencode-accounts?provider=nope`)).status, 404);
+    for (const endpoint of ["/api/provider-keys", "/api/opencode-accounts"]) {
+      const res = await fetch(`${base()}:${port}${endpoint}?provider=go`);
+      assert.equal(res.status, 200);
+      const text = await res.text();
+      assert.ok(!text.includes("test-key-1") && !text.includes("test-key-2"), "no header value is serialised");
+      assert.ok(!/authorization/i.test(text), "not even the header's name");
+      const body = JSON.parse(text) as { provider: string; type: string; accounts: { id: string; label?: string; state: string; at: number; windows: { kind: string; used_percent: number }[] }[] };
+      assert.equal(body.provider, "go");
+      // The wire type is in the answer so a UI does not have to guess what a missing window means.
+      assert.equal(body.type, "openai-compatible");
+      assert.deepEqual(body.accounts.map((a) => [a.id, a.label, a.state]), [["k1", "Work", "in-use"], ["k2", undefined, "paused"]]);
+      assert.equal(body.accounts[0]!.windows[0]!.kind, "five_hour");
+      assert.equal(body.accounts[0]!.at, now);
+      // An unknown provider is a 404 rather than an empty list.
+      assert.equal((await fetch(`${base()}:${port}${endpoint}?provider=nope`)).status, 404);
+    }
   }, {
-    opencodeAccounts: async () => [
+    providerKeys: async () => [
       { id: "k1", label: "Work", state: "in-use", at: now, windows: [{ kind: "five_hour", used_percent: 40, window_minutes: 300 }] },
       { id: "k2", state: "paused", at: 0, windows: [] },
     ],
@@ -2662,4 +2666,144 @@ test("PATCH and DELETE on an OpenCode Go key change `credentials` on disk, and v
     }
     assert.equal(saved().credentials, undefined);
   }, { credentialClear: (provider, id) => cleared.push(`${provider}/${id}`) });
+});
+
+test("GET /api/provider-keys answers for an anthropic-compatible provider too, and names its wire type", async () => {
+  const now = Date.now();
+  const cfg = makeCfg({ providers: {
+    ds: {
+      type: "anthropic-compatible", url: "https://api.deepseek.com/anthropic",
+      credentials: [
+        { id: "k1", label: "Main", headers: { "x-api-key": "test-key-1" } },
+        { id: "k2", headers: { "x-api-key": "test-key-2" }, paused: true },
+      ],
+    },
+  } });
+  await withAdmin(cfg, async ({ port }) => {
+    const res = await fetch(`${base()}:${port}/api/provider-keys?provider=ds`);
+    assert.equal(res.status, 200);
+    const text = await res.text();
+    assert.ok(!text.includes("test-key-1") && !text.includes("test-key-2"), "no key value is serialised");
+    const body = JSON.parse(text) as { provider: string; type: string; accounts: { id: string; label?: string; state: string; at: number; windows: unknown[] }[] };
+    assert.equal(body.type, "anthropic-compatible");
+    assert.deepEqual(body.accounts.map((a) => [a.id, a.label, a.state, a.windows.length]), [
+      ["k1", "Main", "in-use", 0], ["k2", undefined, "paused", 0],
+    ]);
+    assert.equal(body.accounts[0]!.at, now);
+    // A provider that is not key-based keeps its own endpoint: this is a 404, not somebody's accounts.
+    assert.equal((await fetch(`${base()}:${port}/api/provider-keys?provider=nope`)).status, 404);
+  }, {
+    providerKeys: async () => [
+      { id: "k1", label: "Main", state: "in-use", at: now, windows: [] },
+      { id: "k2", state: "paused", at: 0, windows: [] },
+    ],
+  });
+});
+
+test("POST /api/provider-keys appends a key under the provider's own auth header, and never echoes it", async () => {
+  const cfg = makeCfg({ providers: {
+    ds: { type: "anthropic-compatible", url: "https://api.deepseek.com/anthropic", headers: { "x-api-key": "test-key-1", "x-org": "acme" } },
+    or: { type: "openai-compatible", preset: "openrouter", url: "https://openrouter.ai/api/v1" },
+  } });
+  await withAdmin(cfg, async ({ port, configFile }) => {
+    const origin = `http://127.0.0.1:${port}`;
+    const saved = (name: string): { headers?: Record<string, string>; credentials?: { id: string; label?: string; headers: Record<string, string> }[] } =>
+      (JSON.parse(fs.readFileSync(configFile, "utf8")) as { providers: Record<string, { headers?: Record<string, string>; credentials?: { id: string; label?: string; headers: Record<string, string> }[] }> }).providers[name]!;
+
+    // A headers-only provider: its key moves into credentials[0] under the id the router already used.
+    let res = await fetch(`${base()}:${port}/api/provider-keys?provider=ds`, {
+      method: "POST", headers: { "content-type": "application/json", origin }, body: JSON.stringify({ label: "Second", key: "test-key-2" }),
+    });
+    const created = (await res.json()) as { ok: boolean; provider: string; id: string; migrated: boolean };
+    assert.equal(res.status, 201);
+    assert.equal(created.migrated, true);
+    assert.equal(created.id, "key-1");
+    assert.equal(JSON.stringify(created).includes("test-key-2"), false, "the key is not echoed back");
+    const ds = saved("ds");
+    assert.deepEqual(ds.credentials!.map((c) => [c.id, c.label]), [["default", undefined], ["key-1", "Second"]]);
+    assert.deepEqual(ds.credentials![0]!.headers, { "x-api-key": "test-key-1" }, "the old key kept its header and value");
+    // The auth header left `headers`; the provider's other headers stay, sent with every key.
+    assert.deepEqual(ds.headers, { "x-org": "acme" });
+
+    // The new key goes out under the convention this provider already uses (x-api-key), not a bearer.
+    assert.deepEqual(ds.credentials![1]!.headers, { "x-api-key": "test-key-2" });
+    // A provider with no key at all takes its preset's convention (openrouter: bearer).
+    res = await fetch(`${base()}:${port}/api/provider-keys?provider=or`, {
+      method: "POST", headers: { "content-type": "application/json", origin }, body: JSON.stringify({ key: "Bearer test-key-3" }),
+    });
+    assert.equal(res.status, 201);
+    assert.deepEqual((await res.json() as { migrated: boolean }).migrated, false);
+    assert.deepEqual(saved("or").credentials![0]!.headers, { authorization: "Bearer test-key-3" }, "a pasted Bearer prefix is not doubled");
+
+    // A key that cannot travel in a header is refused, and nothing is written.
+    res = await fetch(`${base()}:${port}/api/provider-keys?provider=ds`, {
+      method: "POST", headers: { "content-type": "application/json", origin }, body: JSON.stringify({ key: "test key 4" }),
+    });
+    assert.equal(res.status, 400);
+    const bad = await res.text();
+    assert.ok(!bad.includes("test key 4"), "the refused key is not repeated in the error");
+    assert.equal(saved("ds").credentials!.length, 2);
+    assert.equal((await fetch(`${base()}:${port}/api/provider-keys?provider=nope`, {
+      method: "POST", headers: { "content-type": "application/json", origin }, body: JSON.stringify({ key: "test-key-5" }),
+    })).status, 404);
+  });
+});
+
+test("a headers-only key answers clearCooldown but not a rename, and its id cannot be deleted", async () => {
+  const cleared: string[] = [];
+  const cfg = makeCfg({ providers: {
+    ds: { type: "anthropic-compatible", url: "https://api.deepseek.com/anthropic", headers: { "x-api-key": "test-key-1" } },
+  } });
+  await withAdmin(cfg, async ({ port, configFile }) => {
+    const origin = `http://127.0.0.1:${port}`;
+    const onDisk = (): { headers?: Record<string, string>; credentials?: unknown } => {
+      const saved = (JSON.parse(fs.readFileSync(configFile, "utf8")) as { providers: { ds: { headers?: Record<string, string>; credentials?: unknown } } }).providers.ds;
+      return { ...(saved.headers !== undefined ? { headers: saved.headers } : {}), ...(saved.credentials !== undefined ? { credentials: saved.credentials } : {}) };
+    };
+    // The router calls this provider's one key "default", so clearing its cooldown is honest.
+    let res = await fetch(`${base()}:${port}/api/provider-keys/default?provider=ds`, {
+      method: "PATCH", headers: { "content-type": "application/json", origin }, body: JSON.stringify({ clearCooldown: true }),
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(cleared, ["ds/default"]);
+    // A label has nowhere to be written; refusing beats inventing a `credentials` entry.
+    res = await fetch(`${base()}:${port}/api/provider-keys/default?provider=ds`, {
+      method: "PATCH", headers: { "content-type": "application/json", origin }, body: JSON.stringify({ label: "Main" }),
+    });
+    assert.equal(res.status, 400);
+    // And deleting it would leave the provider with no key at all: the config is untouched.
+    assert.equal((await fetch(`${base()}:${port}/api/provider-keys/default?provider=ds`, { method: "DELETE", headers: { origin } })).status, 400);
+    // An id that is not this provider's is still a 404.
+    assert.equal((await fetch(`${base()}:${port}/api/provider-keys/other?provider=ds`, {
+      method: "PATCH", headers: { "content-type": "application/json", origin }, body: JSON.stringify({ clearCooldown: true }),
+    })).status, 404);
+    assert.deepEqual(onDisk(), { headers: { "x-api-key": "test-key-1" } });
+    assert.deepEqual(cleared, ["ds/default"]);
+  }, { credentialClear: (provider, id) => cleared.push(`${provider}/${id}`) });
+});
+
+test("GET /api/provider-keys carries a credit provider's balance per key, with the label", async () => {
+  const now = Date.now();
+  const cfg = makeCfg({ providers: {
+    openrouter: {
+      type: "anthropic-compatible", url: "https://openrouter.ai/api",
+      credentials: [
+        { id: "k1", label: "Personal", headers: { authorization: "Bearer test-key-1" } },
+        { id: "k2", headers: { authorization: "Bearer test-key-2" } },
+      ],
+    },
+  } });
+  await withAdmin(cfg, async ({ port }) => {
+    const res = await fetch(`${base()}:${port}/api/provider-keys?provider=openrouter`);
+    assert.equal(res.status, 200);
+    const text = await res.text();
+    assert.ok(!text.includes("test-key-1") && !text.includes("test-key-2"), "no key value is serialised");
+    const body = JSON.parse(text) as { accounts: { id: string; label?: string; state: string; windows: unknown[]; credit?: { remaining_usd: number; low: boolean } }[] };
+    assert.deepEqual(body.accounts.map((a) => [a.id, a.label, a.credit?.remaining_usd]), [["k1", "Personal", 3.95], ["k2", undefined, 12]]);
+  }, {
+    providerKeys: async () => [
+      { id: "k1", label: "Personal", state: "cooling", cooldown_seconds: 300, at: now, windows: [], credit: { remaining_usd: 3.95, low: true } },
+      { id: "k2", state: "in-use", at: now, windows: [], credit: { remaining_usd: 12, low: false } },
+    ],
+  });
 });
