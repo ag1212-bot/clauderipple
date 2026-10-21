@@ -1123,7 +1123,13 @@ what we do not have yet — so that adding a provider does not start with readin
   by identity.
   `authHeader` names a convention rather than restating the key: the provider's own
   credential is re-sent under the header that model's wire expects, so there is one copy
-  of the key to rotate. Each endpoint follows the API it imitates — an Anthropic-wire
+  of the key to rotate. That applies to **every credential in the pool**, not only to
+  `provider.headers`: once a key has been added the pool is where the key lives
+  (`credentials[0]`, see the key endpoint below), and re-spelling only the headers left the pool
+  speaking the provider's convention, so every key was refused and quarantined in one
+  turn (2026-10-21). On the `google` wire the key is read from `apiKey`, then from
+  `headers`, then from the first credential that is not paused, for the same reason.
+  Each endpoint follows the API it imitates — an Anthropic-wire
   model wants `x-api-key` where an OpenAI-wire one on the same key wants a bearer. A
   config still written as three providers is folded on the way in and its `direct` and
   `routes` references follow; nothing is rewritten on disk, so it stays readable by an
@@ -1260,7 +1266,8 @@ what we do not have yet — so that adding a provider does not start with readin
     `anthropic-compatible` and `authorization: Bearer` on `openai-compatible` — so a
     key is not sent under a header its endpoint ignores. A pasted `Bearer ` prefix is
     dropped once; internal whitespace or a non-header byte is refused. The write is
-    atomic (temp file + rename) and goes through the same `validate` the GUI's save
+    atomic (temp file + rename, mode `0600` set explicitly rather than left to the
+    service's umask) and goes through the same `validate` the GUI's save
     does. The key is never returned, logged, or quoted in an error. The router picks
     the new key up from the file's mtime, so it is live on the next request with no
     restart.

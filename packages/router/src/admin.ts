@@ -1250,7 +1250,10 @@ function sendJson(res: http.ServerResponse, status: number, body: unknown): void
 function writeConfigFile(configFile: string, config: Config): void {
   const tmp = `${configFile}.tmp-${process.pid}-${Date.now()}`;
   fs.mkdirSync(path.dirname(configFile), { recursive: true });
-  fs.writeFileSync(tmp, JSON.stringify(config, null, 2) + "\n");
+  // The file holds every provider key. The service's UMask makes this 0600 too, but the mode is set
+  // here so a copy written by anything else (a test, a CLI run, a shell with another umask) does not
+  // land world-readable.
+  fs.writeFileSync(tmp, JSON.stringify(config, null, 2) + "\n", { mode: 0o600 });
   fs.renameSync(tmp, configFile);
 }
 

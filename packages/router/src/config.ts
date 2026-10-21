@@ -244,9 +244,10 @@ export function isKeyProvider(p: { type: string }): p is OpenAiCompatibleProvide
  * How a key is spelled in this provider's headers: what its own key already uses, else its preset's
  * convention, else the default for its wire.
  *
- * Read from the existing credential first because a provider may have been configured against an
- * endpoint that takes the other convention (a model entry's `authHeader` says so). Adding a key under
- * the wrong header would be saved, look right in the dashboard, and answer 401 on the next turn.
+ * This answers for the provider as a whole, which is all a saved key needs: the convention it is
+ * stored under is the one the provider's own wire uses. A model that speaks another convention on
+ * another wire is not a second provider, so it does not get a second key — `providerFor` re-sends
+ * the same key under the header that model's endpoint recognises when the turn is routed there.
  */
 export function authConventionOf(p: OpenAiCompatibleProvider | AnthropicCompatibleProvider): "x-api-key" | "authorization-bearer" {
   const sources: (Record<string, string> | undefined)[] = [...(p.credentials ?? []).map((credential) => credential.headers), p.headers];
@@ -297,6 +298,34 @@ function reauthorized(headers: Record<string, string> | undefined, kind: "x-api-
 }
 
 /**
+ * Every credential of a key pool under the header a model's endpoint recognises, ids and labels
+ * untouched.
+ *
+ * The provider stores each key under the convention its own wire uses (see `authConventionOf`), and
+ * a model on another wire reads the same key under the other one. Re-spelling only `provider.headers`
+ * would leave the pool — which is where a migrated key lives — still speaking the provider's
+ * convention, so every key would be refused on that model and the whole pool would be quarantined
+ * in one turn (2026-10-21).
+ */
+function reauthorizedCredentials(credentials: ProviderCredential[] | undefined, kind: "x-api-key" | "authorization-bearer"): ProviderCredential[] | undefined {
+  if (!credentials) return credentials;
+  return credentials.map((credential) => ({ ...credential, headers: reauthorized(credential.headers, kind) ?? credential.headers }));
+}
+
+/**
+ * The key inside the first credential that is not paused (a paused key is the operator's decision,
+ * not a candidate), else undefined.
+ */
+function firstCredentialKey(credentials: ProviderCredential[] | undefined): string | undefined {
+  for (const credential of credentials ?? []) {
+    if (credential.paused) continue;
+    const { key } = credentialIn(credential.headers);
+    if (key !== undefined) return key;
+  }
+  return undefined;
+}
+
+/**
  * The provider shape a request for `model` is actually talking to.
  *
  * A model may speak another wire than the rest of its provider, on another path, under another auth
@@ -320,7 +349,12 @@ export function providerFor(provider: Provider, model: string | undefined): Prov
   // `x-goog-api-key`, never a bearer), and every header that is not the auth one travels along.
   if (entry.wire === "google") {
     const { key, kept } = credentialIn("headers" in provider && provider.headers ? provider.headers : {});
-    const apiKey = "apiKey" in provider && typeof provider.apiKey === "string" ? provider.apiKey : key;
+    // After a key is added the pool holds it, not `headers` (admin.ts migrates it on the first
+    // POST /api/provider-keys), so the key is read from there too: dropping it here would reach the
+    // adapter with no apiKey and charge its local 401 to "default", quarantining the working key.
+    const apiKey = "apiKey" in provider && typeof provider.apiKey === "string"
+      ? provider.apiKey
+      : key ?? firstCredentialKey("credentials" in provider ? provider.credentials : undefined);
     const sessionHeader = "sessionHeader" in provider ? provider.sessionHeader : undefined;
     return {
       type: "google",
@@ -340,10 +374,17 @@ export function providerFor(provider: Provider, model: string | undefined): Prov
   const headers = entry.authHeader
     ? reauthorized("headers" in provider ? provider.headers : undefined, entry.authHeader)
     : ("headers" in provider ? provider.headers : undefined);
+  // The key a request actually goes out with is the one in the credential pool, so the model's
+  // convention has to reach the pool as well as `headers`; re-spelling only the latter leaves every
+  // key under the provider's own header and the endpoint refuses all of them.
+  const credentials = entry.authHeader && "credentials" in provider
+    ? reauthorizedCredentials(provider.credentials, entry.authHeader)
+    : ("credentials" in provider ? provider.credentials : undefined);
   const shared = {
     ...provider,
     ...(url !== undefined ? { url } : {}),
     ...(headers !== undefined ? { headers } : {}),
+    ...(credentials !== undefined ? { credentials } : {}),
   };
 
   // Anthropic Messages needs no translation, so this model is served by the anthropic-compatible

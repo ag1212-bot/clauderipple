@@ -208,6 +208,74 @@ test("a google-wire model folds into a google api-key provider, key taken from t
   assert.equal(providerFor(provider, "gpt-5.6-luna"), provider, "a model with no override is still the provider itself");
 });
 
+// Once a second key is added, the first one no longer lives in `headers` (admin.ts migrates it into
+// `credentials[0]`). The model's own auth convention still has to reach that pool: re-spelling only
+// `headers` sent `authorization: Bearer` to an endpoint that reads `x-api-key`, which answers 401 for
+// every key and quarantined the whole pool in one turn (2026-10-21).
+test("a model's authHeader reaches every credential of the pool, not just the provider's headers", () => {
+  const provider: OpenAiCompatibleProvider = {
+    type: "openai-compatible",
+    url: "https://opencode.ai/zen/go/v1",
+    preset: "opencode-go",
+    headers: { authorization: "Bearer sk-test", "x-extra": "kept" },
+    credentials: [
+      { id: "default", headers: { authorization: "Bearer sk-test" } },
+      { id: "key-1", label: "Work", headers: { authorization: "Bearer sk-second", "x-org": "acme" } },
+      { id: "key-2", headers: { authorization: "Bearer sk-paused" }, paused: true },
+    ],
+    models: [{ id: "minimax-m3", wire: "anthropic", url: "https://opencode.ai/zen/go", authHeader: "x-api-key" }],
+  };
+  const folded = providerFor(provider, "minimax-m3") as AnthropicCompatibleProvider;
+  assert.equal(folded.type, "anthropic-compatible");
+  assert.deepEqual(folded.headers, { "x-extra": "kept", "x-api-key": "sk-test" });
+  assert.deepEqual(folded.credentials, [
+    { id: "default", headers: { "x-api-key": "sk-test" } },
+    { id: "key-1", label: "Work", headers: { "x-org": "acme", "x-api-key": "sk-second" } },
+    { id: "key-2", headers: { "x-api-key": "sk-paused" }, paused: true },
+  ], "each key is re-sent under the model's convention; ids, labels and other headers stay");
+  assert.deepEqual((folded.credentials![0]!.headers as Record<string, string>).authorization, undefined, "the pool does not carry both conventions");
+
+  // The other direction, and a model with no override keeps the pool exactly as configured.
+  const bearer: AnthropicCompatibleProvider = {
+    type: "anthropic-compatible", url: "https://api.deepseek.com/anthropic",
+    headers: { "x-api-key": "sk-test" },
+    credentials: [{ id: "key-1", headers: { "x-api-key": "sk-second" } }],
+    models: [{ id: "openai-wire", wire: "chat", authHeader: "authorization-bearer" }],
+  };
+  const chat = providerFor(bearer as unknown as OpenAiCompatibleProvider, "openai-wire") as OpenAiCompatibleProvider;
+  assert.deepEqual(chat.credentials, [{ id: "key-1", headers: { authorization: "Bearer sk-second" } }]);
+  assert.equal(providerFor(provider, "deepseek-v4.1-flash"), provider, "a model with no override is the provider itself");
+});
+
+// The migration also empties `headers` of its key, so a Gemini model folded from that provider found
+// no apiKey, answered a local 401 charged to "default", and quarantined the key that was working.
+test("a google-wire model takes the key from the credential pool after a headers-only key is migrated", () => {
+  const provider: OpenAiCompatibleProvider = {
+    type: "openai-compatible",
+    url: "https://opencode.ai/zen/go/v1",
+    preset: "opencode-go",
+    sessionHeader: "x-opencode-session",
+    headers: { "x-extra": "kept" },
+    credentials: [
+      { id: "default", headers: { authorization: "Bearer sk-test" } },
+      { id: "key-1", label: "Spent", headers: { authorization: "Bearer sk-spent" }, paused: true },
+      { id: "key-2", headers: { "x-api-key": "sk-second" } },
+    ],
+    models: [{ id: "gemini-4-argon-contributor", wire: "google", url: "https://opencode.ai/inference/go/google" }],
+  };
+  const folded = providerFor(provider, "gemini-4-argon-contributor") as GoogleProvider;
+  assert.equal(folded.apiKey, "sk-test", "the first usable credential supplies the key");
+  assert.deepEqual(folded.headers, { "x-extra": "kept" });
+
+  // A paused key is not a candidate; the next one is. Provider-level `apiKey` still wins.
+  const onlyPaused = providerFor({
+    ...provider,
+    credentials: [{ id: "default", headers: { authorization: "Bearer sk-test" }, paused: true }, ...provider.credentials!.slice(2)],
+  }, "gemini-4-argon-contributor") as GoogleProvider;
+  assert.equal(onlyPaused.apiKey, "sk-second");
+  assert.equal((providerFor({ ...provider, apiKey: "sk-own" } as unknown as OpenAiCompatibleProvider, "gemini-4-argon-contributor") as GoogleProvider).apiKey, "sk-own");
+});
+
 test("validate accepts a google-wire model and a google provider's sessionHeader/headers", () => {
   assert.deepEqual(validate({
     ...DEFAULTS,

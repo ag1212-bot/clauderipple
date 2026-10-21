@@ -2724,6 +2724,8 @@ test("POST /api/provider-keys appends a key under the provider's own auth header
     assert.deepEqual(ds.credentials![0]!.headers, { "x-api-key": "test-key-1" }, "the old key kept its header and value");
     // The auth header left `headers`; the provider's other headers stay, sent with every key.
     assert.deepEqual(ds.headers, { "x-org": "acme" });
+    // The file holds every key, so its mode does not depend on the umask of whoever saved it.
+    assert.equal(fs.statSync(configFile).mode & 0o777, 0o600, "the config file is owner-only");
 
     // The new key goes out under the convention this provider already uses (x-api-key), not a bearer.
     assert.deepEqual(ds.credentials![1]!.headers, { "x-api-key": "test-key-2" });
