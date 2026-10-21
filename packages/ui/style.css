@@ -132,7 +132,7 @@ body {
 .nav-btn.active { background: var(--nav-selected); font-weight: 600; }
 .nav-icon { width: 18px; height: 18px; flex: 0 0 auto; color: var(--accent); }
 .nav-btn span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.sidebar-footer { padding: 0 2px; }
+.sidebar-footer { padding: 12px 2px 0; }
 /* A label too long for the phone tab bar carries a short form for it. */
 .nav-btn .nav-short { display: none; }
 .sidebar-footer select { width: 100%; }
@@ -142,14 +142,19 @@ body {
 /* One panel, moved between two slots by placeUsagePanel(): the sidebar keeps it above the language
    menu, a phone puts it at the top of the Status page. Pushed to the bottom, and scrolling on its
    own once there are more cards than fit: a short window must not push the language menu off the
-   bottom or overlap the navigation above it. */
-.sidebar-slot { margin-top: auto; padding-top: 14px; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+   bottom or overlap the navigation above it. Only the cards scroll, never the panel's header: the
+   slot is a column and the body is the one thing with a scrollbar, so "사용량" stays in place at
+   every window height. */
+.sidebar-slot { margin-top: auto; padding-top: 14px; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
 .sidebar-slot:empty { display: none; }
 .nav-list, .sidebar-footer { flex: 0 0 auto; }
 .usage-slot-phone:empty { display: none; }
 .usage-slot-phone { margin-bottom: 22px; }
 
-.usage-panel { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+/* The header needs air on both sides: 12px under it before the first tile row, and the footer's own
+   12px above the language menu (below), so the block reads as one group instead of a stack that
+   starts touching the menu. */
+.usage-panel { display: flex; flex-direction: column; gap: 12px; min-width: 0; flex: 1 1 auto; min-height: 0; }
 .usage-head {
   appearance: none;
   display: flex;
@@ -175,6 +180,8 @@ body {
 .usage-panel.collapsed .usage-chevron { transform: rotate(-90deg); }
 .usage-panel.collapsed .usage-body { display: none; }
 .usage-body { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+/* In the sidebar only the cards scroll; the header above them stays put (see .sidebar-slot). */
+.sidebar-slot .usage-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
 /* Two tiles to a row, one grid for every provider: six plans still fit the sidebar's height.
    Tiles start at the top of their row, so a one-account reading beside an opened multi-account
    tile is only as tall as its own figures instead of stretching to match the neighbour. */
@@ -1063,7 +1070,8 @@ a.cell { color: inherit; text-decoration: none; }
   /* On a phone the panel leads the Status page, so its tiles read at a thumb's distance. Still two
      to a row: the same shape as the sidebar, only larger. */
   .usage-slot-phone { margin: 0 0 24px; }
-  .usage-panel.in-phone-slot { gap: 8px; }
+  /* The header gets the same air the sidebar panel gives it, so "사용량" never touches the tiles. */
+  .usage-panel.in-phone-slot { gap: 10px; }
   .usage-panel.in-phone-slot .usage-head { padding: 0 2px; font-size: var(--fs-foot); letter-spacing: 0; color: var(--label); }
   .usage-panel.in-phone-slot .usage-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
   .usage-panel.in-phone-slot .usage-tile { padding: 8px 9px 9px; font-size: var(--fs-cap); }
@@ -1089,6 +1097,12 @@ a.cell { color: inherit; text-decoration: none; }
   .provider-detail-actions { justify-content: flex-start; }
   .provider-tabs { display: flex; }
   .provider-tabs button { flex: 1 1 0; }
+  /* A key card beside a long state ("한도 도달 · 3시간 30분 후 다시 사용") left the name column
+     87px wide and stacked its six buttons five deep (2026-10-22). On a phone the badge drops under
+     the name instead of taking width from it. */
+  .account-card { flex-wrap: wrap; row-gap: 6px; }
+  .account-card > .cell-text { flex: 1 1 100%; }
+  .account-card-badges { flex-direction: row; flex-wrap: wrap; align-items: center; padding-top: 0; }
   .logs-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .logs-chip:nth-child(n)::before { display: block; }
   .logs-chip:nth-child(odd)::before { display: none; }

@@ -2193,6 +2193,9 @@ async function probeProvider(name, provider, onComplete) {
   renderHealthProviders();
   try {
     const headers = provider.headers || {};
+    // A provider whose keys moved into `credentials[]` keeps no auth header in `headers`, so the
+    // probe borrows the first usable key's header; otherwise "연결 확인" tested an anonymous request.
+    const credentialHeader = authHeaderName(headers) ? null : credentialAuthHeader(provider);
     const body = provider.type === "anthropic"
       ? { type: "anthropic", auth: provider.auth, ...(provider.auth === "api-key" && provider.apiKey ? { apiKey: provider.apiKey } : {}) }
       : provider.type === "google"
@@ -2202,7 +2205,7 @@ async function probeProvider(name, provider, onComplete) {
       : {
         type: provider.type,
         url: provider.url,
-        headers,
+        headers: credentialHeader ? { ...headers, [credentialHeader.name]: credentialHeader.value } : headers,
         modelsUrl: provider.modelsUrl || (provider.preset && presetById(provider.preset) && presetById(provider.preset).modelsUrl),
         modelsAuthHeader: provider.modelsAuthHeader || (provider.preset && presetById(provider.preset) && presetById(provider.preset).modelsAuthHeader),
         // The router reads the preset's fallback list to tag each discovered model with the wire it
@@ -2855,6 +2858,23 @@ function authHeaderName(headers) {
 function headerValueOf(headers, name) {
   const found = Object.keys(headers || {}).find((header) => header.toLowerCase() === name);
   return found ? headers[found] : undefined;
+}
+
+/**
+ * The auth header a probe should send for a provider whose key lives in `credentials[]`: the first
+ * stored key that is not paused and carries one. A provider migrated to the key pool has no auth
+ * header left in `headers`, so a probe built from `headers` alone tested an unauthenticated request
+ * and called a working provider broken (opencode-go, 2026-10-21). Only the header is returned and it
+ * goes straight into the probe body: no value is ever drawn on the page.
+ */
+function credentialAuthHeader(provider) {
+  const stored = Array.isArray(provider && provider.credentials) ? provider.credentials : [];
+  for (const entry of stored) {
+    if (!entry || entry.paused || !entry.headers) continue;
+    const name = authHeaderName(entry.headers);
+    if (name) return { name, value: entry.headers[name] };
+  }
+  return null;
 }
 
 /**
@@ -4059,6 +4079,12 @@ function openProviderForm(options) {
   }
   function probeDraft() {
     const d = draftProvider();
+    // A saved provider keeps its keys in `credentials[]`, so the form has no auth header to send.
+    // The first usable key's header goes to the probe only; it is never placed in a field.
+    if (!isChatgpt && !authHeaderName(d.headers) && existing) {
+      const borrowed = credentialAuthHeader(existing);
+      if (borrowed) d.headers = { ...(d.headers || {}), [borrowed.name]: borrowed.value };
+    }
     if (preset) { d.modelsUrl = preset.modelsUrl; d.modelsAuthHeader = preset.modelsAuthHeader; d.probeModel = (preset.fallbackModels || [])[0] && preset.fallbackModels[0].id; }
     // With nothing to list models from, test with a model the user ticked rather than a made-up id
     // the provider is bound to refuse.
