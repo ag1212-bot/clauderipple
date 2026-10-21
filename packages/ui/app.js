@@ -468,10 +468,17 @@ function usageAccountName(provider, account, index, count) {
   return count <= 1 ? usageBaseName(provider) : `${usageBaseName(provider)} ${index + 1}`;
 }
 
+// A prepaid-credit vendor writes its own name with capitals; the router only knows its config key.
+// Replace that lowercase default, never a name the user chose.
+const USAGE_CREDIT_NAMES = new Map([["openrouter", "OpenRouter"], ["sail", "sail"]]);
+
 /** The provider's short word: "Claude", "GPT", "Go", "Gemini", "Grok". */
 function usageBaseName(provider) {
   if (provider.type === "opencode-go") return t("usage.goName");
-  return provider.title || provider.provider;
+  const own = provider.title || provider.provider;
+  const lower = String(own).toLowerCase();
+  const proper = provider.type === "credit" && own === lower ? USAGE_CREDIT_NAMES.get(lower) : undefined;
+  return proper || own;
 }
 
 /** The tile's square mark: the short name's first letters, like an app icon ("Cl", "GP", "Go"). */
@@ -600,15 +607,17 @@ function usageTile(provider, accounts) {
   return tile;
 }
 
-/** One tile per provider, two to a row; several accounts share the tile and open on a tap. */
+/**
+ * One tile per provider, two to a row; several accounts share the tile and open on a tap.
+ * Subscription plans (everything that is not prepaid credit) come first, then the credit
+ * balances, each group in config order — the plans are what the user watches, the balance is
+ * a footnote. Config order alone would put them wherever their provider entry happens to sit.
+ */
 function usageTiles(providers) {
-  const tiles = [];
-  for (const provider of providers) {
-    const accounts = Array.isArray(provider.accounts) ? provider.accounts : [];
-    if (!accounts.length) continue;
-    tiles.push(usageTile(provider, accounts));
-  }
-  return tiles;
+  const drawable = providers.filter((provider) => Array.isArray(provider.accounts) && provider.accounts.length);
+  const plans = drawable.filter((provider) => provider.type !== "credit");
+  const credits = drawable.filter((provider) => provider.type === "credit");
+  return [...plans, ...credits].map((provider) => usageTile(provider, provider.accounts));
 }
 
 /**

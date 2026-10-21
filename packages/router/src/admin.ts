@@ -648,14 +648,55 @@ function readSettingsEnv(): { HTTPS_PROXY?: string; NODE_EXTRA_CA_CERTS?: string
   }
 }
 
+/** The GUI files the browser loads; index.html names the rest and is itself never cacheable. */
+const UI_ASSETS = ["index.html", "app.js", "style.css", "i18n.js", "presets-fallback.js"];
+
 /** Newest mtime of the served GUI files; the page reloads itself when this changes (an open window would otherwise run stale JS). */
 function uiRevision(): string {
   try {
-    const files = ["index.html", "app.js", "style.css", "i18n.js", "presets-fallback.js"];
-    return String(Math.max(...files.map((f) => { try { return fs.statSync(path.join(UI_ROOT, f)).mtimeMs; } catch { return 0; } })));
+    return String(Math.max(...UI_ASSETS.map((f) => { try { return fs.statSync(path.join(UI_ROOT, f)).mtimeMs; } catch { return 0; } })));
   } catch {
     return "0";
   }
+}
+
+/**
+ * A short content hash per asset, computed once for the life of this process. An edge cache in
+ * front of the GUI (the phone tunnel's Cloudflare, measured 2026-10-21) keys .js/.css by URL and
+ * ignores the origin's headers unless told otherwise, so after a deploy index.html was new while
+ * app.js and style.css still came from cache. index.html names each asset with `?v=<hash>`, which
+ * a deploy changes, so every release asks the cache for URLs it has never seen. A file that
+ * cannot be read keeps its plain URL rather than failing the page.
+ */
+const uiAssetHashes: Record<string, string> = (() => {
+  const out: Record<string, string> = {};
+  for (const file of UI_ASSETS) {
+    if (file === "index.html") continue;
+    try {
+      out[file] = crypto.createHash("sha256").update(fs.readFileSync(path.join(UI_ROOT, file))).digest("hex").slice(0, 10);
+    } catch {
+      /* absent in this layout: the page's own URL stays */
+    }
+  }
+  return out;
+})();
+
+/** index.html with each asset URL pinned to its deploy's hash. */
+function versionedIndex(data: Buffer): Buffer {
+  let text = data.toString("utf8");
+  for (const [file, hash] of Object.entries(uiAssetHashes)) {
+    text = text.replaceAll(`"${file}"`, `"${file}?v=${hash}"`);
+  }
+  return Buffer.from(text, "utf8");
+}
+
+/**
+ * Every static answer says `no-cache`: the browser and any tunnel cache may keep the bytes, but
+ * must revalidate before reusing them, and the `?v=` spelling already changes with every deploy.
+ */
+function sendStatic(res: http.ServerResponse, type: string, body: Buffer): void {
+  res.writeHead(200, { "content-type": type, "content-length": String(body.length), "cache-control": "no-cache" });
+  res.end(body);
 }
 
 /** Newest CLI the Desktop app has cached, from the same per-platform directories sign-in uses. */
@@ -1889,8 +1930,7 @@ function serveStatic(urlPath: string, res: http.ServerResponse): void {
             sendJson(res, 404, { error: "not found" });
             return;
           }
-          res.writeHead(200, { "content-type": MIME[".html"]! });
-          res.end(data);
+          sendStatic(res, MIME[".html"]!, versionedIndex(data));
         });
         return;
       }
@@ -1899,13 +1939,13 @@ function serveStatic(urlPath: string, res: http.ServerResponse): void {
     }
     const ext = path.extname(full);
     const type = MIME[ext] ?? "application/octet-stream";
+    // `safeStaticPath` already drops the query, so an asset's `?v=<hash>` still resolves here.
     fs.readFile(full, (err2, data) => {
       if (err2) {
         sendJson(res, 500, { error: "read failed" });
         return;
       }
-      res.writeHead(200, { "content-type": type, "content-length": String(data.length) });
-      res.end(data);
+      sendStatic(res, type, ext === ".html" ? versionedIndex(data) : data);
     });
   });
 }

@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import net from "node:net";
@@ -1307,6 +1308,45 @@ test("GET /app.js serves a static file with the right content-type", async () =>
     const res = await fetch(`${base()}:${port}/app.js`);
     assert.equal(res.status, 200);
     assert.match(res.headers.get("content-type") ?? "", /javascript/);
+  });
+});
+
+// The phone tunnel's edge cache keys .js/.css by URL and ignores an origin that says nothing, so a
+// deploy left index.html new and app.js/style.css old. Two answers: every static response says
+// no-cache, and index.html asks for each asset at a URL that changes with its content, which no
+// cache can have a copy of yet.
+test("static answers tell every cache to revalidate", async () => {
+  await withAdmin(makeCfg(), async ({ port }) => {
+    for (const route of ["/", "/index.html", "/app.js", "/style.css", "/i18n.js", "/presets-fallback.js"]) {
+      const res = await fetch(`${base()}:${port}${route}`);
+      assert.equal(res.status, 200, route);
+      assert.match(res.headers.get("cache-control") ?? "", /no-cache/, route);
+    }
+  });
+});
+
+test("index.html names each asset at a content-hashed URL, and a hashed URL still serves the file", async () => {
+  await withAdmin(makeCfg(), async ({ port }) => {
+    const html = await (await fetch(`${base()}:${port}/`)).text();
+    const versions = new Map<string, string>();
+    for (const file of ["app.js", "style.css", "i18n.js", "presets-fallback.js"]) {
+      const match = html.match(new RegExp(`(?:src|href)="${file.replace(/\./g, "\\.")}\\?v=([0-9a-f]{6,})"`));
+      assert.ok(match, `${file} must be named with ?v=<hash> in:\n${html.slice(0, 400)}`);
+      versions.set(file, match![1]!);
+      // The plain spelling stays valid too: a bookmarked page, an open tab, a probe.
+      assert.ok(html.includes(`"${file}?v=`), file);
+      const res = await fetch(`${base()}:${port}/${file}?v=${match![1]}`);
+      assert.equal(res.status, 200, file);
+      assert.match(res.headers.get("cache-control") ?? "", /no-cache/, file);
+      const plain = await (await fetch(`${base()}:${port}/${file}`)).text();
+      assert.equal(await res.text(), plain, `${file}?v= serves the same bytes as ${file}`);
+    }
+    // The hash is the file's content, not a constant: the URL changes exactly when the file does.
+    const app = fs.readFileSync(new URL("../../ui/app.js", import.meta.url));
+    const digest = crypto.createHash("sha256").update(app).digest("hex").slice(0, 10);
+    assert.equal(versions.get("app.js"), digest);
+    // No bare asset URL is left behind for a cache to hold on to.
+    assert.doesNotMatch(html, /(?:src|href)="app\.js"/);
   });
 });
 
