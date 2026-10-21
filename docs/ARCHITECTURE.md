@@ -1229,9 +1229,10 @@ what we do not have yet — so that adding a provider does not start with readin
     snapshot: a key whose window is already at 100 % is not tried at all. This is
     what the user asked for — the plan's Extra-usage pay-as-you-go is never reached
     while another key is free — and it means the vendor is not first asked to refuse.
-    The snapshot is only ever read from the cache on the request path (never
-    fetched); `/api/opencode-accounts` is where a read is awaited, and it parks from
-    the answer it just read rather than starting a second lookup.
+    The snapshot is only ever read from the cache on the request path (never awaited
+    on the request path — a background refresh may start); `/api/opencode-accounts`
+    is where a read is awaited, and it parks from the answer it just read rather
+    than starting a second lookup.
   - `POST /v1/messages/count_tokens` answers locally, so it neither charges the key
     nor cools one: a local estimate must not take a key out of rotation.
   - When **every** key of a provider is paused, the router answers 503 locally

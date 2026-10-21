@@ -146,6 +146,21 @@ test("a quoted number is a delay in seconds, not a date in the year 3600", () =>
   assert.equal(refusalResetAt(JSON.stringify({ reset_at: String(epochSeconds * 1000) }), now), epochSeconds * 1000);
 });
 
+// An epoch already behind `now` is a stale snapshot, exactly as an ISO date in the past is. It used
+// to come back as a reset, so the caller believed the vendor had stated a wait: the key was cooled
+// to a moment that had passed, and the retry was refused again with no cooldown to move it.
+test("a numeric reset in the past is not a wait, as the ISO branch already says", () => {
+  const now = Date.parse("2026-10-21T10:00:00Z");
+  const pastSeconds = Math.round((now - 3_600_000) / 1000);
+  assert.equal(refusalResetAt(JSON.stringify({ resets_at: pastSeconds }), now), undefined, "epoch seconds in the past");
+  assert.equal(refusalResetAt(JSON.stringify({ reset_at: pastSeconds * 1000 }), now), undefined, "epoch ms in the past");
+  assert.equal(refusalResetAt(JSON.stringify({ resets_at: String(pastSeconds) }), now), undefined, "the same epoch quoted");
+  // A refusal that states nothing usable leaves the caller its own delay, while a real future epoch
+  // is still taken as stated.
+  const future = Math.round((now + 1_800_000) / 1000);
+  assert.equal(refusalResetAt(JSON.stringify({ resets_at: future }), now), future * 1000);
+});
+
 // A refusal is about this key now, so a reset it states further out than the pool would ever cool for
 // is held to that ceiling. A usage window's own reset is a real date and is not clamped.
 test("a refusal's stated reset is held to the pool's ceiling; a usage window's stays as stated", () => {

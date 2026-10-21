@@ -1038,7 +1038,11 @@ export class Proxy {
           // never fetches on the request path — so an empty cache simply means "nothing known yet".
           this.parkSpentOpenCodeKeys(providerName, provider, credentials);
           const conversation = conversationKey(json as AnthropicRequest);
-          const first = this.pool.pick(providerName, credentials, conversation) ?? credentials[0]!;
+          // With nothing usable the turn still has to go somewhere (cooling keys are not the
+          // operator's decision, unlike pausing), but never on a paused key: the 503 above already
+          // took every-paused out, so the first non-paused key is the fallback, and `credentials[0]`
+          // only remains for the empty-pool case that cannot happen.
+          const first = this.pool.pick(providerName, credentials, conversation) ?? credentials.find((credential) => !credential.paused) ?? credentials[0]!;
           const triedKeys = new Set<string>([first.id]);
           // The key the attempt in flight is on, so a failure is charged to the key that produced it
           // rather than to the one the turn happened to start on.
@@ -1240,14 +1244,24 @@ export class Proxy {
         // quarantined leaves `chosen` null, and the request goes out on the configured headers so the
         // provider — not us — gets to say no.
         const credentials = this.credentialsOf(route.provider, provider);
+        // Every key paused is the operator's decision, not a failure, so there is no key this turn
+        // may be sent on — the same local refusal the openai-compatible branch makes. Cooling keys
+        // are different: the turn still goes out, on the first one that is not paused.
+        if (credentials.length > 0 && credentials.every((credential) => credential.paused)) {
+          const message = `every key of ${route.provider} is paused`;
+          const out = JSON.stringify({ type: "error", error: { type: "overloaded_error", message } });
+          res.writeHead(503, { "content-type": "application/json", "content-length": String(Buffer.byteLength(out)) }).end(out);
+          finish("503", Buffer.byteLength(out), message, true, { ...(!searchAttempted ? { upstreamCalled: false as const } : {}) });
+          return;
+        }
         // The same key the prompt cache is keyed on. `metadata.user_id` alone is one value for every
         // conversation a user has, so using it raw would drag all of them onto one credential at once
         // — the opposite of what stickiness is for (see conversationKey and ARCHITECTURE §4).
         chosen = this.pool.pick(route.provider, credentials, conversationKey(json as AnthropicRequest));
         // Nothing usable means every credential is cooling, and the turn still has to go somewhere:
-        // the first one, so the request carries real credentials rather than none, and so the answer
-        // is charged to the credential that actually produced it.
-        const using = chosen ?? credentials[0]!;
+        // the first one that is not paused, so the request carries real credentials rather than none,
+        // and so the answer is charged to the credential that actually produced it.
+        const using = chosen ?? credentials.find((credential) => !credential.paused) ?? credentials[0]!;
         chosen = using;
         penalised = { provider: route.provider, id: using.id };
         target = {

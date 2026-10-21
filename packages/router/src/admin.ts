@@ -420,7 +420,26 @@ function changeOpencodeKey(
   return { ok: true };
 }
 
-/** Every provider whose quota can be read, in one shape, for `GET /api/limits`. */
+/**
+ * Whether a key id names a credential of this OpenCode Go provider, read from the config file the
+ * same way `changeOpencodeKey` reads it. Clearing a cooldown touches no config, but it must still
+ * answer an unknown id the way a rename does instead of reporting a success for a key nobody has.
+ */
+function opencodeKeyKnown(deps: AdminDeps, name: string, id: string): "ok" | "not-found" | { error: string } {
+  let current: Config;
+  try {
+    current = JSON.parse(fs.readFileSync(deps.configFile, "utf8")) as Config;
+  } catch (e) {
+    return { error: `could not re-read config: ${errorText(e)}` };
+  }
+  const provider = current.providers[name];
+  if (!provider || provider.type !== "openai-compatible" || !isOpenCodeGo(provider) || !provider.credentials) return "not-found";
+  return provider.credentials.some((credential) => credential.id === id) ? "ok" : "not-found";
+}
+
+/**
+ * Every provider whose quota can be read, in one shape, for `GET /api/limits`.
+ */
 async function buildLimits(deps: AdminDeps): Promise<{ providers: LimitsProvider[] }> {
   const providers: LimitsProvider[] = [];
   const chatgpt = deps.chatgpt?.();
@@ -2095,7 +2114,18 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
           sendJson(res, 400, { error: "expected {label?: non-empty string, paused?: boolean, clearCooldown?: true}" });
           return;
         }
-        if (change.clearCooldown === true) deps.credentialClear?.(name, id);
+        if (change.clearCooldown === true) {
+          // Clearing touches the router's memory, not the file, so the id has to be checked here:
+          // otherwise an unknown key answered 200 and the dashboard showed a cooldown cleared for a
+          // key that does not exist.
+          const known = opencodeKeyKnown(deps, name, id);
+          if (known !== "ok") {
+            if (known === "not-found") sendJson(res, 404, { error: "key not found" });
+            else sendJson(res, 400, { error: known.error });
+            return;
+          }
+          deps.credentialClear?.(name, id);
+        }
         if (change.label !== undefined || change.paused !== undefined) {
           const result = changeOpencodeKey(deps, name, id, {
             ...(typeof change.label === "string" ? { label: change.label } : {}),

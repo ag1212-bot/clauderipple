@@ -343,6 +343,22 @@ test("a paused key is never used, and the turn goes to the next one", async () =
   } finally { await r.stop(); await up.close(); }
 });
 
+test("with one key paused and the other cooling, the turn still goes out on the cooling one", async () => {
+  // The all-paused 503 does not cover this: key-2 is out of rotation only until its cooldown ends, so
+  // there is still a key to send on. The fallback used to be `credentials[0]`, which here is the
+  // paused key — the exact key the operator took out of rotation.
+  const up = await upstream((_key, n) => n === 1 ? rateLimited : answer("second key"));
+  const provider = goPooled(up.port);
+  (provider as { credentials?: { paused?: boolean }[] }).credentials![0]!.paused = true;
+  const r = await rig({ p: provider }, routes);
+  try {
+    assert.equal(await r.send(), 429, "the cooling key's own refusal reaches the client once");
+    // Turn 2: key-1 paused, key-2 cooling, so `pick` has nothing. The turn must still carry key-2.
+    assert.equal(await r.send(), 200);
+    assert.deepEqual(up.keys, ["Bearer test-key-2", "Bearer test-key-2"], "the paused key is never asked, even as the last resort");
+  } finally { await r.stop(); await up.close(); }
+});
+
 test("every key paused is answered locally instead of sending the turn on the first one", async () => {
   // Pausing is the operator's decision, not a failure: there is no key left to send the turn on, and
   // falling back to key 1 would use a key the dashboard says is out of rotation.

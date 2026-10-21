@@ -2601,7 +2601,12 @@ test("PATCH and DELETE on an OpenCode Go key change `credentials` on disk, and v
     assert.equal(res.status, 200);
     assert.deepEqual(cleared, ["go/k2"]);
 
-    // An unknown id is a 404; a bad label is a 400 and changes nothing.
+    // An unknown id is a 404, for a cooldown clear as much as for a pause: the mem clear used to
+    // answer 200 for any string, so the dashboard reported a key it does not have as fixed.
+    assert.equal((await fetch(`${base()}:${port}/api/opencode-accounts/nope?provider=go`, {
+      method: "PATCH", headers: { "content-type": "application/json", origin }, body: JSON.stringify({ clearCooldown: true }),
+    })).status, 404);
+    assert.deepEqual(cleared, ["go/k2"], "an unknown id is not cleared");
     assert.equal((await fetch(`${base()}:${port}/api/opencode-accounts/nope?provider=go`, {
       method: "PATCH", headers: { "content-type": "application/json", origin }, body: JSON.stringify({ paused: true }),
     })).status, 404);

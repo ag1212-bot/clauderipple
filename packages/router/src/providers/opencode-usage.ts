@@ -159,9 +159,11 @@ function moment(value: unknown, now: number): number | undefined {
   }
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return undefined;
   // A magnitude decides the unit: these APIs state epoch seconds or milliseconds, and a small
-  // number is a delay in seconds (the `retry_after` convention).
-  if (value > 1e12) return value;
-  if (value > 1e9) return value * 1000;
+  // number is a delay in seconds (the `retry_after` convention). An epoch already behind `now` is
+  // the same stale snapshot the ISO branch refuses: it is not a wait, and returning it made the
+  // key look parked at a moment that had passed.
+  if (value > 1e12) return value > now ? value : undefined;
+  if (value > 1e9) return value * 1000 > now ? value * 1000 : undefined;
   return now + value * 1000;
 }
 
