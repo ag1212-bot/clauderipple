@@ -180,8 +180,10 @@ body {
 .usage-panel.collapsed .usage-chevron { transform: rotate(-90deg); }
 .usage-panel.collapsed .usage-body { display: none; }
 .usage-body { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
-/* In the sidebar only the cards scroll; the header above them stays put (see .sidebar-slot). */
-.sidebar-slot .usage-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+/* In the sidebar only the cards scroll; the header above them stays put (see .sidebar-slot).
+   The 2px vertical padding is the room the first and last tile's own 1px edge needs: without it
+   the scrolled end clips the last row's bottom stroke against the body's edge. */
+.sidebar-slot .usage-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 2px 0; }
 /* Two tiles to a row, one grid for every provider: six plans still fit the sidebar's height.
    Tiles start at the top of their row, so a one-account reading beside an opened multi-account
    tile is only as tall as its own figures instead of stretching to match the neighbour. */
@@ -195,10 +197,14 @@ body {
   flex-direction: column;
   gap: 2px;
   min-width: 0;
-  padding: 6px 7px 7px;
+  /* The edge is a real 1px border, not a `box-shadow: 0 0 0 1px` ring: a shadow is drawn outside
+     the radius, so the stroke and the fill never share a corner. With border-box sizing the paint
+     and the hit box are the same 1px, and the padding gives back exactly the 2px the border takes
+     (5/6/6 instead of 6/7/7), so the tile's outer size does not change by a pixel. */
+  padding: 5px 6px 6px;
+  border: 1px solid var(--group-edge);
   border-radius: 9px;
   background: color-mix(in srgb, var(--group) 72%, transparent);
-  box-shadow: 0 0 0 1px var(--group-edge);
   color: var(--label-2);
   /* Every figure in the tile — label, percent, time — is set from here, so one row never reads
      louder than the next and the three columns keep the same weight on both layouts. 11px is the
@@ -208,10 +214,22 @@ body {
 }
 /* A provider with several accounts opens them with a tap; a single-account tile is just a reading.
    `font: inherit` here would hand the button the page's body size and blow the figures up, so only
-   the family and line height are inherited and the tile keeps its own size. */
-.usage-tile.expandable { appearance: none; border: 0; font-family: inherit; line-height: inherit; color: inherit; text-align: left; cursor: pointer; }
+   the family and line height are inherited and the tile keeps its own size. The border is the
+   tile's, so the button does not reset it. */
+.usage-tile.expandable { appearance: none; font-family: inherit; line-height: inherit; color: inherit; text-align: left; cursor: pointer; }
 .usage-tile.expandable:hover { background: color-mix(in srgb, var(--group) 92%, transparent); }
-.usage-tile.expandable.open { box-shadow: 0 0 0 1px var(--accent); }
+/* Open reads as the same 1px edge turned up a step, never a saturated frame: the accent mixed back
+   into the resting hairline, plus one small step of background. */
+.usage-tile.expandable.open {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--group-edge));
+  background: color-mix(in srgb, var(--group) 84%, transparent);
+}
+/* The global ring is 3px at 1px offset with 6px corners (and it also resets the radius to 6px),
+   which on a 9px tile draws a second, square-shouldered edge outside the tile. The tile's ring
+   is 2px in the same --focus token, drawn on the tile's own border box (offset -2 on a 2px ring
+   keeps the painted edge flush with the tile) at the tile's 9px corners, so it never adds an
+   outer arc and never leaves the box. */
+.usage-tile:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; border-radius: 9px; }
 /* The mark stays out of the name's way: two characters in a small square, so a longer provider
    name ("OpenRouter") still fits beside it. Nothing in a tile is ellipsised; the full name stays
    on the tile's title. */
@@ -1074,7 +1092,9 @@ a.cell { color: inherit; text-decoration: none; }
   .usage-panel.in-phone-slot { gap: 10px; }
   .usage-panel.in-phone-slot .usage-head { padding: 0 2px; font-size: var(--fs-foot); letter-spacing: 0; color: var(--label); }
   .usage-panel.in-phone-slot .usage-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-  .usage-panel.in-phone-slot .usage-tile { padding: 8px 9px 9px; font-size: var(--fs-cap); }
+  /* The 1px border is the tile's edge at this size too, so the padding gives back that 1px and the
+     phone tile keeps the outer size it had. */
+  .usage-panel.in-phone-slot .usage-tile { padding: 7px 8px 8px; font-size: var(--fs-cap); }
   .usage-panel.in-phone-slot .usage-tile-mark { width: 18px; height: 18px; font-size: 9px; }
   .usage-panel.in-phone-slot .usage-tile-figures { column-gap: 4px; }
   .usage-panel.in-phone-slot .usage-chevron { width: 12px; height: 7px; }
