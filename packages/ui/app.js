@@ -2793,6 +2793,14 @@ function isOpencodeGoProvider(provider) {
 }
 
 /**
+ * The id the router gives the one key a provider keeps in `headers` (proxy `credentialsOf`). The
+ * dashboard shows that key as key 1, but the live-state endpoints (`/api/opencode-accounts`,
+ * `/api/limits`) call it `default`, so the card has to look it up under that id or it shows no
+ * state and no usage at all.
+ */
+const HEADERS_KEY_ID = "default";
+
+/**
  * A provider's keys as the pool reads them. `credentials` is the saved shape; a provider that has
  * only the old `headers.authorization` shows that one as key 1 and is migrated to `credentials` on
  * the first save here. Only ids, labels and header *names* leave this function — never a value.
@@ -2806,7 +2814,8 @@ function keyRowsOf(provider) {
   }
   const headers = (provider && provider.headers) || {};
   const hasKey = Object.entries(headers).some(([name, value]) => /^(authorization|x-api-key)$/i.test(name) && typeof value === "string" && value.trim());
-  return hasKey ? [{ id: "legacy", label: t("keys.legacyLabel"), legacy: true }] : [];
+  // `legacy` still means "there is no credential to PATCH": the acts go through the config save.
+  return hasKey ? [{ id: HEADERS_KEY_ID, label: t("keys.legacyLabel"), legacy: true }] : [];
 }
 
 /** The bearer value a key field was given: whatever was pasted, with stray spaces or a prefix taken off. */
@@ -3032,10 +3041,19 @@ async function setOpencodeKeyPaused(name, row, paused) {
   } catch (error) { toast(t("common.saveFailed"), true, error.message); }
 }
 
-/** "대기 해제": the key is usable again now instead of at its window's reset. */
-async function clearOpencodeCooldown(name, id) {
+/**
+ * "대기 해제": the key is usable again now instead of at its window's reset.
+ *
+ * A key that lives only in the provider's `headers` has no credential id the router's PATCH would
+ * accept (`/api/opencode-accounts/default` answers 404: the endpoint reads `credentials` only), so
+ * for that key the same config save that pause and rename already use is the way: it turns the
+ * headers key into key 1, and the pool has no health recorded for the new id, so the key is picked
+ * again at once.
+ */
+async function clearOpencodeCooldown(name, row) {
   try {
-    await patchOpencodeKey(name, id, { clearCooldown: true });
+    if (row.legacy) await editLegacyKey(name, (entry) => entry);
+    else await patchOpencodeKey(name, row.id, { clearCooldown: true });
     await reloadOpencodeKeys(name);
   } catch (error) { toast(t("common.actionFailed"), true, error.message); }
 }
@@ -3084,7 +3102,7 @@ function renderOpencodeKeyRows(target, data, name) {
     const actions = [];
     if (cooling) {
       const clear = el("button", { class: "btn secondary compact", type: "button", text: t("providers.chatgptClearCooldown") });
-      clear.addEventListener("click", () => void clearOpencodeCooldown(name, row.id));
+      clear.addEventListener("click", () => void clearOpencodeCooldown(name, row));
       actions.push(clear);
     }
     const pause = el("button", { class: "btn secondary compact", type: "button", text: paused ? t("providers.chatgptResume") : t("providers.chatgptPause") });
