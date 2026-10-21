@@ -97,6 +97,33 @@ function uniqueName(name, providers, url) {
   while (providers[value]) value = `${base}-${number++}`;
   return value;
 }
+/**
+ * A base URL as providers are compared: scheme and host lowercased, no trailing slash on the path.
+ * Two entries that differ only in case or a trailing "/" are the same service, and the router's
+ * pool is per provider, so a second entry would split one account's keys into two rotations.
+ */
+function normalizedBaseUrl(url) {
+  const raw = String(url || "").trim();
+  if (!raw) return "";
+  try {
+    const parsed = new URL(raw);
+    const path = parsed.pathname.replace(/\/+$/, "");
+    const query = parsed.search || "";
+    return `${parsed.protocol.toLowerCase()}//${parsed.host.toLowerCase()}${path}${query}`;
+  } catch { return raw.replace(/\/+$/, "").toLowerCase(); }
+}
+/** The provider already serving this base URL, as `[name, provider]`, or null. */
+function providerByBaseUrl(providers, url) {
+  const wanted = normalizedBaseUrl(url);
+  if (!wanted) return null;
+  // Only key-based providers take keys from the merge: ChatGPT, Google and Grok sign in instead,
+  // and a Claude subscription provider has its own account list.
+  for (const [name, provider] of Object.entries(providers || {})) {
+    if (!isKeyBasedProvider(provider)) continue;
+    if (normalizedBaseUrl(provider.url) === wanted) return [name, provider];
+  }
+  return null;
+}
 function groupedModels(config) {
   const groups = [];
   for (const [name, provider] of Object.entries(config.providers || {})) {
@@ -567,9 +594,12 @@ function usageAccountRows(account) {
 const usageInUse = new Map();
 const usageExpanded = new Set();
 
-/** Accounts whose rows are worth drawing: a credit tile has one balance, not an account list. */
+/**
+ * Accounts whose rows are worth drawing: any provider with several accounts opens them, prepaid
+ * credit included — a credit vendor with two keys shows the key in use and the rest behind a tap.
+ */
 function usageExpandable(provider, accounts) {
-  return accounts.length > 1 && provider.type !== "credit";
+  return accounts.length > 1;
 }
 
 function usageTile(provider, accounts) {
@@ -625,6 +655,18 @@ function usageTiles(providers) {
  * in the same order as these lists, but only counts the ones it has quota for, so the answer is an
  * index to look up, not a promise; a miss falls back to the first account.
  */
+async function usageKeyAccounts(name, type) {
+  // Every key-based provider (subscription or prepaid credit) answers on the same endpoint; the old
+  // OpenCode Go one is still there for a router that predates it.
+  try { return await api(`/api/provider-keys?provider=${encodeURIComponent(name)}`); }
+  catch (error) {
+    // Only a router too old to know the new path (404) is worth asking the old one; any other
+    // failure is the answer, and asking twice would only hide it.
+    if (type === "opencode-go" && error.status === 404) return api(`/api/opencode-accounts?provider=${encodeURIComponent(name)}`);
+    throw error;
+  }
+}
+
 async function resolveUsageInUse(providers) {
   let changed = false;
   for (const provider of providers) {
@@ -637,8 +679,8 @@ async function resolveUsageInUse(providers) {
         const body = await api(`/api/chatgpt-accounts?provider=${encodeURIComponent(name)}`);
         const list = (Array.isArray(body.accounts) ? body.accounts : []).filter((a) => a.state !== "paused" && a.state !== "needs-login");
         at = list.findIndex((a) => a.active === true);
-      } else if (provider.type === "opencode-go") {
-        const body = await api(`/api/opencode-accounts?provider=${encodeURIComponent(name)}`);
+      } else if (provider.type !== "anthropic" && provider.type !== "google" && provider.type !== "grok") {
+        const body = await usageKeyAccounts(name, provider.type);
         const list = Array.isArray(body.accounts) ? body.accounts : [];
         at = list.findIndex((a) => a.state === "in-use");
       }
@@ -2343,7 +2385,7 @@ async function removeProvider(name, provider) {
 
 function providerTabs(name, provider) {
   const tabs = [{ id: "overview", label: t("providers.overview") }];
-  if ((provider.type === "anthropic" && provider.auth === "claude-code") || provider.type === "chatgpt" || (provider.type === "google" && provider.auth === "antigravity") || isOpencodeGoProvider(provider)) tabs.push({ id: "accounts", label: t("providers.accounts") });
+  if ((provider.type === "anthropic" && provider.auth === "claude-code") || provider.type === "chatgpt" || (provider.type === "google" && provider.auth === "antigravity") || isKeyBasedProvider(provider)) tabs.push({ id: "accounts", label: t("providers.accounts") });
   tabs.push({ id: "models", label: t("providers.modelsTab") });
   return el("div", { class: "provider-tabs", role: "tablist" }, tabs.map((tab) => {
     const button = el("button", { class: providerDetailTab === tab.id ? "active" : "", type: "button", role: "tab", "aria-selected": String(providerDetailTab === tab.id), text: tab.label });
@@ -2782,19 +2824,20 @@ function chatgptAccountsPanel(name) {
   return panel;
 }
 
-/** Whether this provider is an OpenCode Go subscription, whose keys form a pool (router: isOpenCodeGo). */
-function isOpencodeGoProvider(provider) {
-  if (!provider || provider.type !== "openai-compatible") return false;
-  if (provider.preset === "opencode-go") return true;
-  try {
-    const url = new URL(provider.url);
-    return url.hostname === "opencode.ai" && /^\/zen\/go\/v1(?:\/|$)/.test(url.pathname);
-  } catch { return false; }
+/**
+ * Whether this provider is one whose keys form a pool: every API-key provider (OpenAI-compatible and
+ * Anthropic-compatible, subscription or prepaid credit alike). ChatGPT, Google and Grok sign in
+ * instead of taking a key, and the Claude subscription keeps its own account list, so neither is
+ * here. The router's `/api/provider-keys` answers for exactly these.
+ */
+const KEY_BASED_TYPES = new Set(["openai-compatible", "anthropic-compatible"]);
+function isKeyBasedProvider(provider) {
+  return Boolean(provider) && KEY_BASED_TYPES.has(provider.type);
 }
 
 /**
  * The id the router gives the one key a provider keeps in `headers` (proxy `credentialsOf`). The
- * dashboard shows that key as key 1, but the live-state endpoints (`/api/opencode-accounts`,
+ * dashboard shows that key as key 1, but the live-state endpoints (`/api/provider-keys`,
  * `/api/limits`) call it `default`, so the card has to look it up under that id or it shows no
  * state and no usage at all.
  */
@@ -2821,14 +2864,6 @@ function keyRowsOf(provider) {
 /** The bearer value a key field was given: whatever was pasted, with stray spaces or a prefix taken off. */
 function keyValueOf(text) {
   return String(text || "").trim().replace(/^bearer\s+/i, "").replace(/\s+/g, "");
-}
-
-/** A fresh id for a key: `key-1`, `key-2`, … skipping ids already used. */
-function nextKeyId(rows) {
-  const used = new Set(rows.map((row) => row.id));
-  let number = 1;
-  while (used.has(`key-${number}`)) number += 1;
-  return `key-${number}`;
 }
 
 /**
@@ -2873,8 +2908,14 @@ async function saveProviderKeys(name, change) {
   renderProviderDetail();
 }
 
-/** Add a key: a label and the key itself, in the sheet every other add uses. */
-function openAddKeyDialog(name) {
+/**
+ * Add a key to a provider: a label and the key itself, in the sheet every other add uses.
+ *
+ * The key is saved through `POST /api/provider-keys` and joins the pool at once — the router has no
+ * separate "enable" step, and the form says so. Afterwards the provider's 계정 tab is shown with the
+ * new card, because that is where its state and place in the order live.
+ */
+function openAddKeyDialog(name, options) {
   const labelInput = el("input", { type: "text", maxlength: "60", autocomplete: "off", placeholder: t("keys.labelPlaceholder") });
   const keyInput = el("input", { type: "password", autocomplete: "off", spellcheck: "false", placeholder: t("keys.keyPlaceholder") });
   const showKey = el("button", { class: "eye-button", type: "button", text: t("common.show") });
@@ -2900,16 +2941,13 @@ function openAddKeyDialog(name) {
     save.disabled = true;
     const label = labelInput.value.trim();
     try {
-      await saveProviderKeys(name, (byId, stored, sharedHeaders) => {
-        // The id is picked from what is actually stored, not from the rows on screen: a legacy key
-        // is shown as `legacy` but is migrated to `key-1` just before this runs, and reusing the
-        // on-screen ids made the new key collide with it.
-        const id = nextKeyId(stored);
-        const entry = { id, label: label || t("keys.defaultLabel", { number: stored.length + 1 }), headers: { ...sharedHeaders, authorization: `Bearer ${key}` } };
-        return [...stored, entry];
+      await api(`/api/provider-keys?provider=${encodeURIComponent(name)}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ label, key }),
       });
       closeModal();
-      toast(t("keys.added"));
+      await afterKeyAdded(name, options);
     } catch (error) {
       save.disabled = false;
       toast(t("common.saveFailed"), true, error.message);
@@ -2925,13 +2963,31 @@ function openAddKeyDialog(name) {
       problem,
       el("small", { text: t("keys.keyHelp") }),
     ]),
+    el("p", { class: "small", text: t("keys.addRotationNote") }),
     el("div", { class: "actions end" }, [el("button", { class: "btn secondary", type: "button", text: t("common.cancel"), onclick: closeModal }), save]),
   ]));
 }
 
 /**
+ * After a key is saved: re-read the config, open the provider's 계정 tab and draw its cards. The
+ * add-provider path hands back the name it merged into, so the page follows to that provider.
+ */
+async function afterKeyAdded(name, options) {
+  try { currentConfig = await api("/api/config"); } catch { /* the panel reports an unreachable router */ }
+  // Without a config there is no rail to draw; the toast still says the key was saved.
+  if (!currentConfig) { toast((options && options.notice) || t("keys.added")); return; }
+  selectedProviderName = name;
+  providerDetailTab = "accounts";
+  if (!$("#view-providers").classList.contains("active")) showView("providers");
+  $("#view-providers").classList.add("show-detail");
+  renderProviderWorkspace();
+  const notice = options && options.notice;
+  toast(notice || t("keys.added"));
+}
+
+/**
  * Rename one key. The label is the only editable thing: the router never hands a saved key back.
- * `apply` lets a caller save through its own endpoint (an OpenCode Go key's `PATCH`); without one
+ * `apply` lets a caller save through its own endpoint (`PATCH /api/provider-keys/:id`); without one
  * the label goes through the config save, which is what a provider form's keys use.
  */
 function openRenameKeyDialog(name, row, apply) {
@@ -2984,29 +3040,38 @@ function moveProviderKey(name, row, rows, delta) {
 }
 
 /**
- * OpenCode Go's keys. The same card list as the ChatGPT accounts tab: one card per key, in the order
- * the router tries them, with the key's state, its usage and the same actions. A conversation keeps
- * its own key while that key is healthy, so the order only matters when one is cooling.
+ * A key-based provider's keys. The same card list as the ChatGPT accounts tab: one card per key, in
+ * the order the router tries them, with the key's state, its usage (or its balance for a prepaid
+ * credit vendor) and the same actions. A conversation keeps its own key while that key is healthy,
+ * so the order only matters when one is cooling.
  *
- * Every act on a saved key goes to the dedicated endpoint (`PATCH`/`DELETE /api/opencode-accounts/:id`)
- * so the router writes the key's own field and no other card's header is touched. The config save
- * (`PUT /api/config`) is kept for the two things only it can do: adding a key and reordering.
+ * Every act on a saved key goes to `/api/provider-keys` so the router writes the key's own field and
+ * no other card's header is touched. A key that lives only in the provider's old `headers` shape is
+ * migrated by the router when it is added or paused through the same endpoint; the config save
+ * (`PUT /api/config`) still carries the order.
  *
  * A stored key is shown as "저장한 키를 쓰고 있습니다" and nothing more — the router keeps the value,
  * and this screen never puts it back on the page.
  */
-const OPENCODE_STATES = new Set(["in-use", "standby", "cooling", "paused", "quarantined"]);
+const KEY_STATES = new Set(["in-use", "standby", "cooling", "paused", "quarantined"]);
 
 /** "5시간 33% · 주간 86% · 월간 55%" — the same line the ChatGPT cards use for a quota. */
-function opencodeQuotaText(windows) {
+function keyQuotaText(windows) {
   const list = Array.isArray(windows) ? windows : [];
   return list.filter((window) => window && typeof window.used_percent === "number").map((window) =>
     t("quota.line", { window: usageWindowLongName(window), percent: Math.round(window.used_percent) }).trim(),
   ).join(" · ");
 }
 
-function opencodeStateBadge(account) {
-  const state = OPENCODE_STATES.has(account.state) ? account.state : null;
+/** A key's prepaid balance as the card writes it: "잔액 $738", and the days left when known. */
+function keyCreditText(credit) {
+  if (!credit || typeof credit.remaining_usd !== "number") return "";
+  const days = typeof credit.days_remaining === "number" && Number.isFinite(credit.days_remaining) ? ` · ${usageCreditDays(credit.days_remaining)}` : "";
+  return `${t("usage.creditBalance")} ${usageUsd(credit.remaining_usd)}${days}`;
+}
+
+function keyStateBadge(account) {
+  const state = KEY_STATES.has(account.state) ? account.state : null;
   const cooldown = typeof account.cooldown_seconds === "number" ? account.cooldown_seconds : 0;
   if (state === "paused") return el("span", { class: "badge", text: t("providers.chatgptPaused") });
   if (state === "quarantined") return el("span", { class: "badge bad", text: t("keys.stateQuarantined") });
@@ -3015,9 +3080,15 @@ function opencodeStateBadge(account) {
   return el("span", { class: "badge", text: t("providers.chatgptStandby") });
 }
 
+/** The provider's key endpoint; `id` names one saved key. */
+function keyUrl(name, id) {
+  const base = `/api/provider-keys${id ? `/${encodeURIComponent(id)}` : ""}?provider=${encodeURIComponent(name)}`;
+  return base;
+}
+
 /** The one PATCH shape the endpoint takes: a label, a pause flag, or a cooldown cleared now. */
-async function patchOpencodeKey(name, id, change) {
-  await api(`/api/opencode-accounts/${encodeURIComponent(id)}?provider=${encodeURIComponent(name)}`, {
+async function patchProviderKey(name, id, change) {
+  await api(keyUrl(name, id), {
     method: "PATCH",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(change),
@@ -3025,69 +3096,68 @@ async function patchOpencodeKey(name, id, change) {
 }
 
 /**
- * The key stored only in the provider's `headers` has no credential id for the endpoint to address
- * (the router's endpoint reads `credentials` only). Editing it goes through the config save, which
- * turns it into key 1 as it writes; `apply` edits that one saved entry.
+ * The key stored only in the provider's `headers` has no credential id for the endpoint to address.
+ * Editing it goes through the config save, which turns it into key 1 as it writes; `apply` edits
+ * that one saved entry.
  */
 function editLegacyKey(name, apply) {
   return saveProviderKeys(name, (byId, stored) => stored.map((entry, index) => (index === 0 ? apply(entry) : entry)));
 }
 
-async function setOpencodeKeyPaused(name, row, paused) {
+async function setProviderKeyPaused(name, row, paused) {
   try {
     if (row.legacy) await editLegacyKey(name, (entry) => ({ ...entry, paused: paused || undefined }));
-    else await patchOpencodeKey(name, row.id, { paused });
-    await reloadOpencodeKeys(name);
+    else await patchProviderKey(name, row.id, { paused });
+    await reloadProviderKeys(name);
   } catch (error) { toast(t("common.saveFailed"), true, error.message); }
 }
 
 /**
  * "대기 해제": the key is usable again now instead of at its window's reset.
  *
- * A key that lives only in the provider's `headers` has no credential id the router's PATCH would
- * accept (`/api/opencode-accounts/default` answers 404: the endpoint reads `credentials` only), so
- * for that key the same config save that pause and rename already use is the way: it turns the
- * headers key into key 1, and the pool has no health recorded for the new id, so the key is picked
- * again at once.
+ * A key that lives only in the provider's old `headers` shape has no credential id the router's
+ * PATCH would accept, so for that key the config save that pause already uses is the way: it turns
+ * the headers key into key 1, and the pool has no health recorded for the new id, so the key is
+ * picked again at once.
  */
-async function clearOpencodeCooldown(name, row) {
+async function clearProviderKeyCooldown(name, row) {
   try {
     if (row.legacy) await editLegacyKey(name, (entry) => entry);
-    else await patchOpencodeKey(name, row.id, { clearCooldown: true });
-    await reloadOpencodeKeys(name);
+    else await patchProviderKey(name, row.id, { clearCooldown: true });
+    await reloadProviderKeys(name);
   } catch (error) { toast(t("common.actionFailed"), true, error.message); }
 }
 
-async function renameOpencodeKey(name, row, label) {
+async function renameProviderKey(name, row, label) {
   try {
-    if (row.legacy) await editLegacyKey(name, row, (entry) => ({ ...entry, label }));
-    else await patchOpencodeKey(name, row.id, { label });
-    await reloadOpencodeKeys(name);
+    if (row.legacy) await editLegacyKey(name, (entry) => ({ ...entry, label }));
+    else await patchProviderKey(name, row.id, { label });
+    await reloadProviderKeys(name);
   } catch (error) { toast(t("common.saveFailed"), true, error.message); }
 }
 
-async function removeOpencodeKey(name, row) {
+async function removeProviderKeyById(name, row) {
   if (!confirm(t("keys.removeConfirm", { name: row.label }))) return;
   try {
     if (row.legacy) await saveProviderKeys(name, (byId, stored) => []);
-    else await api(`/api/opencode-accounts/${encodeURIComponent(row.id)}?provider=${encodeURIComponent(name)}`, { method: "DELETE" });
+    else await api(keyUrl(name, row.id), { method: "DELETE" });
     toast(t("keys.removed"));
-    await reloadOpencodeKeys(name);
+    await reloadProviderKeys(name);
   } catch (error) { toast(t("common.saveFailed"), true, error.message); }
 }
 
 /** The config changed under us (a key added, paused, renamed or removed): re-read it, then draw. */
-async function reloadOpencodeKeys(name) {
+async function reloadProviderKeys(name) {
   try { currentConfig = await api("/api/config"); } catch { /* keep the copy on screen */ }
   if (selectedProviderName === name && providerDetailTab === "accounts") renderProviderDetail();
 }
 
 /**
- * Draw the key cards. `data` is `GET /api/opencode-accounts` — `{ accounts: [{ id, label?, state,
- * cooldown_seconds?, at, windows }] }` — or null when this router does not have that endpoint yet
- * (an older build), in which case the cards still list and edit the keys from the config.
+ * Draw the key cards. `data` is `GET /api/provider-keys` — `{ accounts: [{ id, label?, state,
+ * cooldown_seconds?, at, windows, credit? }] }` — or null when this router does not have that
+ * endpoint yet (an older build), in which case the cards still list and edit the keys from the config.
  */
-function renderOpencodeKeyRows(target, data, name) {
+function renderProviderKeyRows(target, data, name) {
   const provider = currentConfig && currentConfig.providers && currentConfig.providers[name];
   if (!provider) return;
   const rows = keyRowsOf(provider);
@@ -3102,11 +3172,11 @@ function renderOpencodeKeyRows(target, data, name) {
     const actions = [];
     if (cooling) {
       const clear = el("button", { class: "btn secondary compact", type: "button", text: t("providers.chatgptClearCooldown") });
-      clear.addEventListener("click", () => void clearOpencodeCooldown(name, row));
+      clear.addEventListener("click", () => void clearProviderKeyCooldown(name, row));
       actions.push(clear);
     }
     const pause = el("button", { class: "btn secondary compact", type: "button", text: paused ? t("providers.chatgptResume") : t("providers.chatgptPause") });
-    pause.addEventListener("click", () => void setOpencodeKeyPaused(name, row, !paused));
+    pause.addEventListener("click", () => void setProviderKeyPaused(name, row, !paused));
     const up = el("button", { class: "icon-btn", type: "button", "aria-label": t("keys.moveUp"), title: t("keys.moveUp") }, [svgIcon("0 0 10 6", ["M1 5l4-4 4 4"])]);
     up.disabled = index === 0;
     up.addEventListener("click", () => moveProviderKey(name, row, rows, -1));
@@ -3114,26 +3184,28 @@ function renderOpencodeKeyRows(target, data, name) {
     down.disabled = index === rows.length - 1;
     down.addEventListener("click", () => moveProviderKey(name, row, rows, 1));
     const rename = el("button", { class: "btn secondary compact", type: "button", text: t("common.edit") });
-    rename.addEventListener("click", () => openRenameKeyDialog(name, row, (label) => renameOpencodeKey(name, row, label)));
+    rename.addEventListener("click", () => openRenameKeyDialog(name, row, (label) => renameProviderKey(name, row, label)));
     const remove = el("button", { class: "btn danger compact", type: "button", text: t("common.remove") });
-    remove.addEventListener("click", () => void removeOpencodeKey(name, row));
+    remove.addEventListener("click", () => void removeProviderKeyById(name, row));
     actions.push(pause, up, down, rename, remove);
-    const quota = known ? opencodeQuotaText(account.windows) : "";
+    const quota = known ? keyQuotaText(account.windows) : "";
+    const credit = known ? keyCreditText(account.credit) : "";
     return el("article", { class: `cell account-card${inUse ? " current" : ""}` }, [
       el("div", { class: "cell-text account-card-copy" }, [
         el("strong", { text: (account && account.label) || row.label }),
         el("span", { class: "small mono key-saved", text: t("providers.keySaved") }),
         row.legacy ? hint(t("keys.legacyHelp")) : null,
         quota ? el("p", { class: "small account-quota", text: quota }) : null,
+        credit ? el("p", { class: `small account-quota${account.credit.low ? " bad-text" : ""}`, text: credit }) : null,
         el("div", { class: "account-card-actions" }, actions),
       ]),
       el("div", { class: "account-card-badges" }, [
-        known ? opencodeStateBadge(account) : null,
+        known ? keyStateBadge(account) : null,
       ].filter(Boolean)),
     ]);
   });
   target.replaceChildren(...(cards.length ? cards : [el("div", { class: "account-empty", text: t("keys.empty") })]));
-  const countNode = $("#opencode-key-count");
+  const countNode = $("#provider-key-count");
   if (countNode) countNode.textContent = t("keys.count", { count: rows.length });
 }
 
@@ -3144,30 +3216,30 @@ function byIdPaused(name, id) {
   return Boolean(entry && entry.paused);
 }
 
-async function refreshOpencodeKeyPanel(name) {
-  const target = $("#opencode-key-rows");
+async function refreshProviderKeyPanel(name) {
+  const target = $("#provider-key-rows");
   if (!target || selectedProviderName !== name || providerDetailTab !== "accounts") return;
   const generation = providerDetailGeneration;
   let data = null;
-  try { data = await api(`/api/opencode-accounts?provider=${encodeURIComponent(name)}`); }
+  try { data = await api(keyUrl(name)); }
   catch { /* an older router has no state endpoint yet: the cards still list and edit the keys */ }
   if (generation !== providerDetailGeneration) return;
-  renderOpencodeKeyRows(target, data, name);
+  renderProviderKeyRows(target, data, name);
 }
 
-function opencodeKeysPanel(name) {
+function providerKeysPanel(name) {
   const add = el("button", { class: "cell-button", type: "button", text: t("keys.addAction") });
   add.addEventListener("click", () => openAddKeyDialog(name));
-  const rows = el("div", { id: "opencode-key-rows", class: "group account-card-list" }, [el("div", { class: "small", text: t("providers.checking") })]);
+  const rows = el("div", { id: "provider-key-rows", class: "group account-card-list" }, [el("div", { class: "small", text: t("providers.checking") })]);
   const panel = el("div", { class: "provider-panel" }, [
     el("section", { class: "section" }, [
-      el("div", { class: "section-head" }, [el("h3", { class: "section-title", text: t("keys.title") }), el("span", { id: "opencode-key-count", class: "small", text: t("keys.count", { count: 0 }) })]),
+      el("div", { class: "section-head" }, [el("h3", { class: "section-title", text: t("keys.title") }), el("span", { id: "provider-key-count", class: "small", text: t("keys.count", { count: 0 }) })]),
       rows,
       el("div", { class: "group stacked-add" }, [add]),
       el("p", { class: "group-footer", text: t("keys.subtitle") }),
     ]),
   ]);
-  queueMicrotask(() => void refreshOpencodeKeyPanel(name));
+  queueMicrotask(() => void refreshProviderKeyPanel(name));
   return panel;
 }
 
@@ -3183,18 +3255,21 @@ function renderProviderDetail() {
   const check = el("button", { class: "btn secondary", type: "button", text: t("providers.check") });
   check.addEventListener("click", async () => { check.disabled = true; await probeProvider(name, provider); check.disabled = false; renderProviderWorkspace(); });
   const edit = el("button", { class: "btn secondary", type: "button", text: t("common.edit"), onclick: () => openProviderForm({ name, provider }) });
+  // A provider that takes API keys offers the key first: it is the thing people come here to do.
+  const addKey = isKeyBasedProvider(provider) ? el("button", { class: "btn", type: "button", text: t("providers.addApiKey") }) : null;
+  if (addKey) addKey.addEventListener("click", () => openAddKeyDialog(name));
   // Removing is the one destructive act on this page, so it sits apart at the bottom, not beside Edit.
   const remove = el("button", { class: "cell-button destructive", type: "button", text: t("providers.remove"), onclick: () => void removeProvider(name, provider) });
   const back = el("button", { class: "provider-back", type: "button", onclick: closeProviderDetail }, [svgIcon("0 0 9 15", ["M7.5 1.5l-6 6 6 6"]), el("span", { text: t("nav.providers") })]);
   const header = el("header", { class: "provider-detail-header" }, [
     el("div", {}, [el("div", { class: "provider-title-line" }, [el("h2", { text: name }), providerState(name, provider)]), el("p", { class: "small", text: providerKind(name, provider) })]),
-    el("div", { class: "provider-detail-actions" }, [check, edit]),
+    el("div", { class: "provider-detail-actions" }, [addKey, check, edit].filter(Boolean)),
   ]);
   let content;
   if (providerDetailTab === "accounts" && provider.type === "anthropic" && provider.auth === "claude-code") content = anthropicAccountsPanel(name, provider);
   else if (providerDetailTab === "accounts" && provider.type === "chatgpt") content = chatgptAccountsPanel(name);
   else if (providerDetailTab === "accounts" && provider.type === "google" && provider.auth === "antigravity") content = googleAccountsPanel(name);
-  else if (providerDetailTab === "accounts" && isOpencodeGoProvider(provider)) content = opencodeKeysPanel(name);
+  else if (providerDetailTab === "accounts" && isKeyBasedProvider(provider)) content = providerKeysPanel(name);
   else if (providerDetailTab === "models") content = providerModelsPanel(name, provider);
   else { providerDetailTab = "overview"; content = providerOverview(name, provider); }
   detail.replaceChildren(back, header, providerTabs(name, provider), content, el("div", { class: "group provider-remove" }, [remove]));
@@ -3955,7 +4030,7 @@ function openProviderForm(options) {
   }
   async function runProbe() {
     const draft = probeDraft();
-    if (!draft.url || !/^https?:\/\//.test(draft.url)) { toast(t("providers.urlRequired"), true); return; }
+    if (!draft.url || !/^https?:\/\//i.test(draft.url)) { toast(t("providers.urlRequired"), true); return; }
     probeButton.disabled = true;
     result.textContent = t("providers.checking");
     const temporary = `__new_${Date.now()}`;
@@ -4020,7 +4095,34 @@ function openProviderForm(options) {
     const typedName = nameInput.value.trim();
     if (!typedName) { toast(t("providers.nameRequired"), true); return; }
     const provider = draftProvider();
-    if (!isChatgpt && (!provider.url || !/^https?:\/\//.test(provider.url))) { toast(t("providers.urlRequired"), true); return; }
+    if (!isChatgpt && (!provider.url || !/^https?:\/\//i.test(provider.url))) { toast(t("providers.urlRequired"), true); return; }
+    // Same base URL = the same service. Adding a provider at an address one already answers on
+    // would split that service's keys into two pools and two rotations, so the key joins the
+    // provider that is already there instead of making a twin. Only a new provider can merge;
+    // editing one keeps its own identity.
+    if (!existing && isKeyBasedProvider(provider)) {
+      const typedKey = keyValueOf(keyInput.value);
+      const twin = providerByBaseUrl((currentConfig && currentConfig.providers) || {}, provider.url);
+      if (twin && !typedKey) { toast(t("providers.existingNeedsKey", { name: twin[0] }), true); return; }
+      if (twin && typedKey) {
+        saveButton.disabled = true;
+        try {
+          await api(`/api/provider-keys?provider=${encodeURIComponent(twin[0])}`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ label: typedName, key: typedKey }),
+          });
+          closeModal();
+          slotsLoaded = false;
+          providersLoaded = false;
+          await afterKeyAdded(twin[0], { notice: t("providers.addedToExisting", { name: twin[0] }) });
+        } catch (error) {
+          saveButton.disabled = false;
+          toast(t("common.saveFailed"), true, error.message);
+        }
+        return;
+      }
+    }
     const next = clone(await latestConfig());
     const providerName = existing ? options.name : uniqueName(typedName, next.providers, provider.url);
     const saved = existing && (next.providers[options.name] || existing);
