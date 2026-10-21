@@ -127,6 +127,12 @@ export type CredentialReport = {
  */
 export class CredentialPool {
   private readonly health = new Map<string, Health>();
+  /**
+   * Keys held out of rotation because a prepaid balance read said zero. Kept apart from `health`: a
+   * later read that finds money again must release the key without erasing a cooldown the vendor
+   * itself set, and a zero balance is not a failure the vendor reported about a request.
+   */
+  private readonly empty = new Map<string, number>();
   /** conversation → durable owner id (or runtime id when there is no owner), preserving its cache across token refreshes. */
   private readonly sticky = new Map<string, { provider: string; ownerId: string; at: number }>();
   private readonly now: () => number;
@@ -151,6 +157,7 @@ export class CredentialPool {
     // A paused credential is out of rotation by decision, not by failure, so it keeps its place in
     // the list (and so its priority) while never being picked.
     if (credential.paused) return false;
+    if ((this.empty.get(this.key(provider, credential.id)) ?? 0) > this.now()) return false;
     const h = this.healthOf(provider, credential.id);
     return !h.quarantined && h.cooldownUntil <= this.now();
   }
@@ -198,6 +205,26 @@ export class CredentialPool {
     if (h.cooldownUntil < at) h.cooldownUntil = at;
   }
 
+  /**
+   * Park a key whose prepaid balance read said it has nothing left, until `at` (the next balance
+   * read). Not a failure verdict: it is not the vendor refusing a request, and it is released the
+   * moment a later read finds money again (`releaseEmpty`).
+   */
+  parkEmpty(provider: string, id: string, at: number): void {
+    const key = this.key(provider, id);
+    if ((this.empty.get(key) ?? 0) < at) this.empty.set(key, at);
+  }
+
+  /** A later balance read found money: let the key back into rotation now. */
+  releaseEmpty(provider: string, id: string): void {
+    this.empty.delete(this.key(provider, id));
+  }
+
+  /** Whether `id` is being held out because its balance read said zero. */
+  emptySince(provider: string, id: string): number {
+    return this.empty.get(this.key(provider, id)) ?? 0;
+  }
+
   /** Record a failure. Returns the verdict so the caller can decide whether to try the next one. */
   penalise(provider: string, id: string, status: number, retryAfterMs?: number, body = ""): Verdict {
     const verdict = classify(status, retryAfterMs, body);
@@ -225,8 +252,9 @@ export class CredentialPool {
 
   /** Operator action from the dashboard: give a parked credential another chance now. */
   clear(provider: string, id?: string): void {
-    if (id) { this.health.delete(this.key(provider, id)); return; }
+    if (id) { this.health.delete(this.key(provider, id)); this.empty.delete(this.key(provider, id)); return; }
     for (const key of [...this.health.keys()]) if (key.startsWith(`${provider}/`)) this.health.delete(key);
+    for (const key of [...this.empty.keys()]) if (key.startsWith(`${provider}/`)) this.empty.delete(key);
   }
 
   /** For the Health screen: why a credential is not being used, and for how long. */
@@ -234,7 +262,11 @@ export class CredentialPool {
     const now = this.now();
     return credentials.map((c) => {
       const h = this.healthOf(provider, c.id);
-      const cooling = !h.quarantined && h.cooldownUntil > now;
+      // An empty prepaid balance rests a key exactly the way a vendor cooldown does: it is not ready,
+      // but nothing about it failed. The dashboard shows one "cooling until" figure either way.
+      const emptyUntil = this.empty.get(this.key(provider, c.id)) ?? 0;
+      const coolingUntil = Math.max(h.cooldownUntil, emptyUntil);
+      const cooling = !h.quarantined && coolingUntil > now;
       // Paused before cooling and quarantine: the operator's own decision is the reason a key is
       // out of rotation, and the dashboard should offer "resume" for it rather than "clear cooldown".
       const state: CredentialReport["state"] = c.paused ? "paused" : h.quarantined ? "quarantined" : cooling ? "cooling" : "ready";
@@ -242,7 +274,7 @@ export class CredentialPool {
         id: c.id,
         ...(c.label ? { label: c.label } : {}),
         state,
-        ...(cooling ? { cooldownSeconds: Math.ceil((h.cooldownUntil - now) / 1000) } : {}),
+        ...(cooling ? { cooldownSeconds: Math.ceil((coolingUntil - now) / 1000) } : {}),
         failures: h.failures,
       };
     });

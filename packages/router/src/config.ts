@@ -233,6 +233,34 @@ export type GrokProvider = {
 export type Provider = AnthropicCompatibleProvider | ChatGptProvider | OpenAiCompatibleProvider | GoogleProvider | AnthropicProvider | GrokProvider;
 
 /**
+ * A provider that holds API keys of its own, as opposed to one with an account system (chatgpt,
+ * google, grok) or a Claude login. Only these take `credentials`.
+ */
+export function isKeyProvider(p: { type: string }): p is OpenAiCompatibleProvider | AnthropicCompatibleProvider {
+  return p.type === "openai-compatible" || p.type === "anthropic-compatible";
+}
+
+/**
+ * How a key is spelled in this provider's headers: what its own key already uses, else its preset's
+ * convention, else the default for its wire.
+ *
+ * Read from the existing credential first because a provider may have been configured against an
+ * endpoint that takes the other convention (a model entry's `authHeader` says so). Adding a key under
+ * the wrong header would be saved, look right in the dashboard, and answer 401 on the next turn.
+ */
+export function authConventionOf(p: OpenAiCompatibleProvider | AnthropicCompatibleProvider): "x-api-key" | "authorization-bearer" {
+  const sources: (Record<string, string> | undefined)[] = [...(p.credentials ?? []).map((credential) => credential.headers), p.headers];
+  for (const headers of sources) {
+    if (!headers) continue;
+    if (Object.keys(headers).some((name) => name.toLowerCase() === "x-api-key")) return "x-api-key";
+    if (Object.keys(headers).some((name) => name.toLowerCase() === "authorization")) return "authorization-bearer";
+  }
+  const preset = p.preset ? PRESETS.find((entry) => entry.id === p.preset) : undefined;
+  if (preset?.authHeader) return preset.authHeader;
+  return p.type === "anthropic-compatible" ? "x-api-key" : "authorization-bearer";
+}
+
+/**
  * The provider's own key wherever its headers carry it, and every header that is not that one.
  *
  * Both auth conventions in use are recognised (`x-api-key` and `Authorization: Bearer`), because

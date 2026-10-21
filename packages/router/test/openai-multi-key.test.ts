@@ -12,8 +12,9 @@ import os from "node:os";
 import path from "node:path";
 import tls from "node:tls";
 
+import { startAdmin } from "../src/admin.ts";
 import { CertStore } from "../src/certs.ts";
-import { DEFAULTS, type Config, type Provider } from "../src/config.ts";
+import { ConfigStore, DEFAULTS, type Config, type Provider } from "../src/config.ts";
 import { UpstreamHealth } from "../src/health.ts";
 import { Logger } from "../src/log.ts";
 import { Proxy } from "../src/proxy.ts";
@@ -102,22 +103,37 @@ const rateLimited: Reply = { status: 429, headers: { "retry-after": "300" }, bod
 
 type Rig = {
   proxy: Proxy;
+  /** The config file the proxy reads, so a test can drive the admin API against the same router. */
+  configFile: string;
+  /** The hot-reloading store behind `config()` when `configStore` was asked for. */
+  store?: ConfigStore;
   send: (conversation?: string) => Promise<number>;
   /** The same request as `send`, but `/v1/messages/count_tokens`, which the router answers locally. */
   sendCount: (conversation?: string) => Promise<number>;
   stop: () => Promise<void>;
 };
 
-/** A live proxy in front of `providers`, reached the way Claude Code reaches it. */
-async function rig(providers: Config["providers"], routes: Config["routes"], opts: { usageFetch?: (url: string, init?: RequestInit) => Promise<Response>; usageTtlMs?: number } = {}): Promise<Rig> {
+/**
+ * A live proxy in front of `providers`, reached the way Claude Code reaches it.
+ *
+ * `configStore` puts the config in a file and reads it through the same `ConfigStore` the router
+ * runs, so a test can write that file the way the admin API does and see the next request pick it
+ * up — the no-restart path, which a `config: () => cfg` closure cannot show.
+ */
+async function rig(providers: Config["providers"], routes: Config["routes"], opts: { usageFetch?: (url: string, init?: RequestInit) => Promise<Response>; usageTtlMs?: number; creditFetch?: (url: string, init?: RequestInit) => Promise<Response>; creditTtlMs?: number; creditVendor?: (provider: { url?: string }) => "sail" | "openrouter" | null; configStore?: boolean } = {}): Promise<Rig> {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-openai-keys-"));
   const ca = createCa({ cn: "clauderipple test" });
   fs.writeFileSync(path.join(home, "ca.pem"), ca.certPem);
   fs.writeFileSync(path.join(home, "ca.key"), ca.keyPem);
   const proxyPort = await freePort();
   const cfg: Config = { ...DEFAULTS, listen: { host: "127.0.0.1", port: proxyPort }, providers, routes, direct: [] };
+  const configFile = path.join(home, "config.json");
+  fs.writeFileSync(configFile, JSON.stringify(cfg, null, 2));
+  // Backdated, so a write in the same millisecond as this one is still a different mtime to the store.
+  fs.utimesSync(configFile, new Date(Date.now() - 5_000), new Date(Date.now() - 5_000));
+  const store = opts.configStore ? new ConfigStore(configFile) : undefined;
   const proxy = new Proxy({
-    config: () => cfg,
+    config: () => store ? store.get() : cfg,
     log: new Logger(path.join(home, "router.log"), 1e6, 1, false),
     certs: new CertStore(home),
     health: new UpstreamHealth(() => 100, () => {}),
@@ -125,6 +141,15 @@ async function rig(providers: Config["providers"], routes: Config["routes"], opt
     requests: new RequestLog(path.join(home, "requests.jsonl")),
     ...(opts.usageFetch || opts.usageTtlMs !== undefined
       ? { opencodeUsage: { ...(opts.usageFetch ? { fetch: opts.usageFetch } : {}), ...(opts.usageTtlMs !== undefined ? { ttlMs: opts.usageTtlMs } : {}) } }
+      : {}),
+    ...(opts.creditFetch || opts.creditTtlMs !== undefined || opts.creditVendor
+      ? {
+        creditBalance: {
+          ...(opts.creditFetch ? { fetch: opts.creditFetch } : {}),
+          ...(opts.creditTtlMs !== undefined ? { ttlMs: opts.creditTtlMs } : {}),
+          ...(opts.creditVendor ? { vendor: opts.creditVendor } : {}),
+        },
+      }
       : {}),
   });
   await proxy.listen();
@@ -149,7 +174,7 @@ async function rig(providers: Config["providers"], routes: Config["routes"], opt
     return Number(/^HTTP\/1\.1 (\d{3})/.exec(first.toString("latin1"))?.[1] ?? 0);
   };
 
-  return { proxy, send, sendCount: (conversation = "user-1") => send(conversation, "/v1/messages/count_tokens"), stop: async () => { proxy.close(); fs.rmSync(home, { recursive: true, force: true }); } };
+  return { proxy, configFile, ...(store ? { store } : {}), send, sendCount: (conversation = "user-1") => send(conversation, "/v1/messages/count_tokens"), stop: async () => { proxy.close(); fs.rmSync(home, { recursive: true, force: true }); } };
 }
 
 /** Two keys for one provider; each is a complete header set, as the config declares them. */
@@ -451,6 +476,128 @@ test("the provider's own headers still travel with a credential; only its auth i
     assert.equal(sent.authorization, "Bearer test-key-1", "the key in rotation, not the configured one");
     assert.equal(sent["x-org"], "acme", "the provider's own header came along");
   } finally { await r.stop(); await up.close(); }
+});
+
+/** The admin API in front of the same proxy, so a write goes through the real endpoint. */
+async function adminFor(r: Rig) {
+  return startAdmin({
+    config: () => r.store!.get(),
+    configFile: r.configFile,
+    log: new Logger(null, 1e6, 1, false),
+    stats: () => ({ inFlight: 0, messagesInFlight: 0, started: 0, completed: 0, failed: 0 }),
+    health: () => 0,
+    version: "0.0.0-test",
+    requests: new RequestLog(path.join(path.dirname(r.configFile), "admin-requests.jsonl")),
+    providerKeys: (name) => r.proxy.providerKeys(name),
+    creditBalance: (name) => r.proxy.creditLimits(name),
+    credentialClear: (provider, id) => r.proxy.credentialClear(provider, id),
+  });
+}
+
+// A prepaid key that cannot pay is not a failed key: it has nothing left until someone tops it up.
+// It must not be handed a new conversation before then, and the balance read is the only thing that
+// can bring it back — so the dashboard's own poll has to be enough, without a restart.
+test("a key with an empty prepaid balance is skipped, and a later read that finds money releases it", async () => {
+  const up = await upstream(() => answer("ok"));
+  // Remaining credit per key, as the fake vendor reports it: key-1 is spent, key-2 is not.
+  const remaining: Record<string, number> = { "Bearer test-key-1": 0, "Bearer test-key-2": 12 };
+  const creditFetch = async (_url: string, init?: RequestInit): Promise<Response> => {
+    const auth = String((init?.headers as Record<string, string>)?.authorization ?? "");
+    const left = remaining[auth] ?? 0;
+    return new Response(JSON.stringify({ data: { total_credits: 100, total_usage: 100 - left } }), { status: 200 });
+  };
+  // One second, not zero: the read's own cache period is also how long the park lasts, so the next
+  // read (the dashboard's next poll) is exactly what can release it.
+  const r = await rig({ p: pooled(up.port) }, routes, { creditFetch, creditTtlMs: 1_000, creditVendor: () => "openrouter", configStore: true });
+  const admin = await adminFor(r);
+  const api = `http://127.0.0.1:${admin.port}`;
+  try {
+    // The limits read is what fills the balance cache the request path looks at (in production a
+    // timer does this at the reader's own pace).
+    const limits = (await (await fetch(`${api}/api/limits`)).json()) as { providers: { provider: string; type: string; accounts: { account: number; label?: string; credit?: { remaining_usd: number } }[] }[] };
+    const row = limits.providers.find((p) => p.provider === "p")!;
+    assert.equal(row.type, "credit");
+    assert.deepEqual(row.accounts.map((a) => [a.account, a.label, a.credit?.remaining_usd]), [[0, "First key", 0], [1, "Second key", 12]]);
+
+    // key-1 is spent, so a new conversation goes to key-2 — the vendor is never asked to refuse it.
+    assert.equal(await r.send("new-conv"), 200);
+    assert.deepEqual(up.keys, ["Bearer test-key-2"], "the empty key was skipped before the turn");
+    const keys = (await (await fetch(`${api}/api/provider-keys?provider=p`)).json()) as { accounts: { id: string; state: string }[] };
+    assert.deepEqual(keys.accounts.map((a) => [a.id, a.state]), [["key-1", "cooling"], ["key-2", "in-use"]]);
+
+    // Money came back, and the dashboard's next poll is what says so — no restart, and no request
+    // made to a key the router still believes is empty.
+    remaining["Bearer test-key-1"] = 40;
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    const after = (await (await fetch(`${api}/api/provider-keys?provider=p`)).json()) as { accounts: { id: string; state: string; credit?: { remaining_usd: number } }[] };
+    assert.deepEqual(after.accounts.map((a) => [a.id, a.state, a.credit?.remaining_usd]), [["key-1", "in-use", 40], ["key-2", "standby", 12]]);
+    assert.equal(await r.send("another-conv"), 200);
+    assert.equal(up.keys.at(-1), "Bearer test-key-1", "a topped-up key is first in order again");
+  } finally { admin.close(); await r.stop(); await up.close(); }
+});
+
+// The same rule on the other wire: an `anthropic-compatible` balance is per key too, and an empty
+// one parks that key the same way — this is the wire sail speaks.
+test("an anthropic-compatible provider's empty-balance key is skipped too", async () => {
+  const up = await upstream(() => answer("ok"));
+  const creditFetch = async (_url: string, init?: RequestInit): Promise<Response> => {
+    // The key is what the balance is read with, so the answer is per key here as well.
+    const key = String((init?.headers as Record<string, string>)?.["x-api-key"] ?? "");
+    const left = key === "test-key-1" ? 0 : 9;
+    // sail's shape: `balance` is fractional cents.
+    return new Response(JSON.stringify({ balance: left * 100, days_remaining: 5 }), { status: 200 });
+  };
+  const provider: Provider = {
+    type: "anthropic-compatible",
+    url: `http://127.0.0.1:${up.port}`,
+    credentials: [
+      { id: "key-1", headers: { "x-api-key": "test-key-1" } },
+      { id: "key-2", headers: { "x-api-key": "test-key-2" } },
+    ],
+  } as Provider;
+  // Not OpenCode Go: the usage reader must have nothing to do with this provider.
+  const r = await rig({ p: provider }, routes, { creditFetch, creditTtlMs: 60_000, creditVendor: () => "sail" });
+  try {
+    const rows = await r.proxy.creditLimits("p");
+    assert.deepEqual(rows.map((row) => [row.id, row.credit.remaining_usd]), [["key-1", 0], ["key-2", 9]]);
+    assert.equal(await r.send("conv"), 200);
+    assert.deepEqual(up.headers.map((h) => h["x-api-key"]), ["test-key-2"], "the spent key was never asked");
+    assert.equal((await r.proxy.providerKeys("p")).map((row) => row.state).join(","), "cooling,in-use");
+  } finally { await r.stop(); await up.close(); }
+});
+
+// The key the user pastes into the GUI has to be the key the very next turn carries. The config is
+// written through the admin endpoint and picked up by mtime, which is the path a `config()` closure
+// in a test would hide.
+test("a key added through POST /api/provider-keys is used by the next request without a restart", async () => {
+  const up = await upstream(() => answer("ok"));
+  const provider: Provider = { type: "openai-compatible", url: `http://127.0.0.1:${up.port}/v1`, headers: { authorization: "Bearer test-key-1" } };
+  const r = await rig({ p: provider }, routes, { configStore: true });
+  const admin = await adminFor(r);
+  const api = `http://127.0.0.1:${admin.port}`;
+  try {
+    assert.equal(await r.send("user-1"), 200);
+    assert.deepEqual(up.keys, ["Bearer test-key-1"]);
+
+    const post = await fetch(`${api}/api/provider-keys?provider=p`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ key: "test-key-2", label: "Second" }),
+    });
+    assert.equal(post.status, 201);
+    const created = (await post.json()) as { id: string; migrated: boolean };
+    assert.equal(created.migrated, true);
+    assert.equal(created.id, "key-1");
+
+    // The router's own view of the config has both keys now — this is the reload, not the file.
+    const keys = (await (await fetch(`${api}/api/provider-keys?provider=p`)).json()) as { accounts: { id: string; label?: string; state: string }[] };
+    assert.deepEqual(keys.accounts.map((a) => [a.id, a.label]), [["default", undefined], ["key-1", "Second"]]);
+
+    // Take the old key out of rotation, and the next turn must carry the new one.
+    assert.equal((await fetch(`${api}/api/provider-keys/default?provider=p`, {
+      method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ paused: true }),
+    })).status, 200);
+    assert.equal(await r.send("user-2"), 200);
+    assert.deepEqual(up.keys, ["Bearer test-key-1", "Bearer test-key-2"], "the pasted key drove the next turn, no restart");
+  } finally { admin.close(); await r.stop(); await up.close(); }
 });
 
 test("a key whose usage has never been read reports unknown, and a failed read keeps the last good answer", async () => {

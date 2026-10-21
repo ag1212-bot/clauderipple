@@ -36,8 +36,9 @@ import { ChatGptAdapter, type ChatGptAccountStatus, type ImageRequest, type Imag
 import { OpenAiCompatibleAdapter } from "./providers/openai/index.ts";
 import { GoogleAdapter, type GoogleAccountStatus } from "./providers/google/index.ts";
 import type { QuotaGroup } from "./providers/google/usage.ts";
-import { OpenCodeUsage, isOpenCodeGo, refusalResetAt, spentWindowReset, type OpenCodeAccountState, type OpenCodeLimit } from "./providers/opencode-usage.ts";
-import { CreditBalances, creditVendor, type CreditLimit } from "./providers/credit-balance.ts";
+import { OpenCodeUsage, isOpenCodeGo, refusalResetAt, spentWindowReset, type OpenCodeAccountState, type OpenCodeLimit, type OpenCodeWindow } from "./providers/opencode-usage.ts";
+import { CreditBalances, creditVendor, type CreditBalance, type CreditLimit, type CreditVendor } from "./providers/credit-balance.ts";
+import { isKeyProvider } from "./config.ts";
 import { GrokAdapter } from "./providers/grok/index.ts";
 import type { GrokWindow } from "./providers/grok/usage.ts";
 import { conversationKey, type AnthropicRequest } from "./providers/chatgpt/translate.ts";
@@ -55,6 +56,24 @@ import { dropForeignThinking } from "./thinking.ts";
 
 const MAX_BODY = 64 * 1024 * 1024;
 const HOP_BY_HOP = new Set(["connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade", "host", "content-length"]);
+
+/**
+ * One key of any key-based provider, as `GET /api/provider-keys` reports it. Ids and labels only;
+ * `windows` is OpenCode Go's usage, `credit` a prepaid balance — every other provider has neither.
+ */
+export type ProviderKeyState = {
+  id: string;
+  label?: string;
+  state: "in-use" | "standby" | "cooling" | "paused" | "quarantined" | "unknown";
+  cooldown_seconds?: number;
+  /** epoch ms of the reading behind this row (usage or balance); 0 when there is none. */
+  at: number;
+  windows: OpenCodeWindow[];
+  credit?: CreditBalance;
+};
+
+/** One credit-selling key's balance, as `/api/limits` and the dashboard read it. */
+export type CreditKeyLimit = { id: string; label?: string; credit: CreditBalance; at: number };
 // The caller's own Anthropic credentials. A routed request authenticates as the provider, so these
 // are dropped rather than forwarded: the provider header replaces only the one it happens to share
 // a name with, and the other would otherwise travel to an endpoint that is not Anthropic.
@@ -123,6 +142,18 @@ export function withCredential(
   }
   for (const [k, v] of Object.entries(credential)) out.push(k, v);
   return out;
+}
+
+/**
+ * The names a provider's headers may carry its key under; a credential supplies these instead.
+ * The openai-compatible adapter has the same rule for its own header merge.
+ */
+const AUTH_HEADERS = new Set(["authorization", "x-api-key"]);
+
+/** A provider's headers without whatever authenticates it, so the credential is the only key sent. */
+function withoutAuthHeaders(headers: Record<string, string> | undefined): Record<string, string> {
+  if (!headers) return {};
+  return Object.fromEntries(Object.entries(headers).filter(([name]) => !AUTH_HEADERS.has(name.toLowerCase())));
 }
 
 /**
@@ -217,8 +248,12 @@ export type ProxyDeps = {
    * cache period; a test needs both to be decided by the test rather than by the network and a clock.
    */
   opencodeUsage?: { fetch?: (url: string, init?: RequestInit) => Promise<Response>; ttlMs?: number };
-  /** The same seam for the credit-balance reader (sail, OpenRouter), `/api/limits` only. */
-  creditBalance?: { fetch?: (url: string, init?: RequestInit) => Promise<Response>; ttlMs?: number };
+  /**
+   * The same seam for the credit-balance reader (sail, OpenRouter); `/api/limits` and the key cards.
+   * `vendor` overrides the host test production uses, so a turn against a local fake can still be
+   * the turn of a credit-selling provider.
+   */
+  creditBalance?: { fetch?: (url: string, init?: RequestInit) => Promise<Response>; ttlMs?: number; vendor?: (provider: { url?: string }) => CreditVendor | null };
 };
 
 export type Stats = {
@@ -477,19 +512,46 @@ export class Proxy {
     })));
   }
 
+  /** The balance reader a provider belongs to. A seam for tests, which cannot reach a real vendor. */
+  private creditVendorOf(provider: object): CreditVendor | null {
+    return this.deps.creditBalance?.vendor ? this.deps.creditBalance.vendor(provider) : creditVendor(provider);
+  }
+
   /**
-   * A credit-selling provider's remaining balance, for the status bar's limits row, or null when
-   * this provider sells no credit. Only the first credential's headers are sent: a balance belongs
-   * to the account, and the other keys of one provider read the same one.
+   * A credit-selling provider's remaining balance, per key, for the status bar's limits row. A
+   * balance belongs to the key that asked for it, so every key of the provider is read with its own
+   * headers and gets its own row; a key whose read fails is left out rather than shown as zero.
+   * Empty for a provider that sells no credit.
+   */
+  async creditLimits(name: string): Promise<CreditKeyLimit[]> {
+    const cfg = this.deps.config().providers[name];
+    if (!cfg) return [];
+    const vendor = this.creditVendorOf(cfg);
+    if (!vendor) return [];
+    const credentials = this.credentialsOf(name, cfg);
+    const rows = await Promise.all(credentials.map(async (credential): Promise<CreditKeyLimit | null> => {
+      const cacheKey = `${name}/${credential.id}`;
+      const balance = await this.creditBalances.balance(cacheKey, vendor, credential.headers);
+      if (!balance) return null;
+      // An empty balance is not a failure, it is a spent key: parked the same way a spent usage
+      // window is, so a new conversation is never sent to a key that cannot pay. A later read that
+      // finds money releases it here, so the dashboard's own poll is what brings a topped-up key back
+      // without a restart.
+      if (balance.remaining_usd > 0) this.pool.releaseEmpty(name, credential.id);
+      else this.parkEmptyBalance(name, credential.id);
+      return { id: credential.id, ...(credential.label ? { label: credential.label } : {}), credit: balance, at: this.creditBalances.readAt(cacheKey) };
+    }));
+    return rows.filter((row): row is CreditKeyLimit => row !== null);
+  }
+
+  /**
+   * One credit-selling provider's balance, for callers that still want a single figure (the CLI's
+   * status line). The first key that has a readable balance answers.
    */
   async creditLimit(name: string): Promise<CreditLimit | null> {
-    const cfg = this.deps.config().providers[name];
-    if (!cfg) return null;
-    const vendor = creditVendor(cfg);
-    if (!vendor) return null;
-    const headers = this.credentialsOf(name, cfg)[0]?.headers ?? {};
-    const balance = await this.creditBalances.balance(name, vendor, headers);
-    return balance ? { credit: balance, at: this.creditBalances.readAt(name) } : null;
+    const rows = await this.creditLimits(name);
+    const first = rows[0];
+    return first ? { credit: first.credit, at: first.at } : null;
   }
 
   /** Dashboard action: put one resting Google account back into rotation now. */
@@ -1037,6 +1099,9 @@ export class Proxy {
           // window resets, the way a ChatGPT account at 100% is. This reads the usage cache only —
           // never fetches on the request path — so an empty cache simply means "nothing known yet".
           this.parkSpentOpenCodeKeys(providerName, provider, credentials);
+          // The same pre-emptive rule for a prepaid key: one whose cached balance read says zero is
+          // skipped until the next read can say otherwise.
+          this.parkEmptyBalanceKeys(providerName, provider, credentials);
           const conversation = conversationKey(json as AnthropicRequest);
           // With nothing usable the turn still has to go somewhere (cooling keys are not the
           // operator's decision, unlike pausing), but never on a paused key: the 503 above already
@@ -1254,6 +1319,9 @@ export class Proxy {
           finish("503", Buffer.byteLength(out), message, true, { ...(!searchAttempted ? { upstreamCalled: false as const } : {}) });
           return;
         }
+        // A prepaid key whose cached balance says zero is skipped for a new conversation, exactly as
+        // a spent OpenCode Go window is; OpenCode-only usage parking stays inside its own helper.
+        this.parkEmptyBalanceKeys(route.provider, provider, credentials);
         // The same key the prompt cache is keyed on. `metadata.user_id` alone is one value for every
         // conversation a user has, so using it raw would drag all of them onto one credential at once
         // — the opposite of what stickiness is for (see conversationKey and ARCHITECTURE §4).
@@ -1269,11 +1337,16 @@ export class Proxy {
           host: u.hostname,
           port: Number(u.port) || (protocol === "https:" ? 443 : 80),
           agent: this.agentFor(route.provider, protocol),
-          // The credential wins over the session header: they are different names in practice, but a
-          // vendor that reused one would mean the request going out unauthenticated.
-          extraHeaders: provider.sessionHeader
-            ? { [provider.sessionHeader]: conversationKey(json as AnthropicRequest), ...using.headers }
-            : using.headers,
+          // The provider's own headers travel with every key — an org id, a vendor flag — but its
+          // authentication does not: the credential is the complete auth set (config.ts
+          // ProviderCredential), and a leftover auth header beside it would send a key that is not in
+          // rotation. The credential wins over the session header too: they are different names in
+          // practice, but a vendor that reused one would mean the request going out unauthenticated.
+          extraHeaders: {
+            ...withoutAuthHeaders("headers" in provider ? provider.headers : undefined),
+            ...(provider.sessionHeader ? { [provider.sessionHeader]: conversationKey(json as AnthropicRequest) } : {}),
+            ...using.headers,
+          },
           dropClientAuth: true,
           // Providers mount their Anthropic-compatible API under a path (DeepSeek /anthropic, OpenRouter /api,
           // Qwen /apps/anthropic): the CLI's /v1/messages is appended to it. Dropping it sent requests to the
@@ -1697,10 +1770,23 @@ export class Proxy {
     // already parses; an openai-compatible one is asked through its chat web plugin.
     // OpenCode Go refuses a request without its session header outright (400 MissingSessionID).
     const sessionHeader = "sessionHeader" in provider ? provider.sessionHeader : undefined;
+    const userHeaders = "headers" in provider && provider.headers ? provider.headers : {};
+    // A key-based provider authenticates through its credential pool, not `headers`: once a provider
+    // that kept its key in `headers` gains a key (POST /api/provider-keys migrates it into
+    // `credentials`), `headers` no longer carries authentication. A search side request rides the same
+    // key rotation as an ordinary turn — the first usable key, never a paused one — because a search
+    // that went out under nobody's key would answer 401 on a provider whose models work.
+    const keyBased = provider.type === "openai-compatible" || provider.type === "anthropic-compatible";
+    const credentials = keyBased ? this.credentialsOf(settings.provider, provider) : [];
+    const using = keyBased ? this.pool.pick(settings.provider, credentials) ?? credentials.find((credential) => !credential.paused) : undefined;
     const common = {
       name: settings.provider,
       url: url ?? "",
-      headers: { ...(("headers" in provider && provider.headers) || {}), ...(sessionHeader ? { [sessionHeader]: crypto.randomUUID() } : {}) },
+      headers: {
+        ...(keyBased ? withoutAuthHeaders(userHeaders) : userHeaders),
+        ...(using ? using.headers : {}),
+        ...(sessionHeader ? { [sessionHeader]: crypto.randomUUID() } : {}),
+      },
       model: settings.model,
       ...(settings.maxResults ? { maxResults: settings.maxResults } : {}),
     };
@@ -1836,6 +1922,24 @@ export class Proxy {
   }
 
   /**
+   * Park every key of a credit-selling provider whose last balance read said nothing is left, until
+   * the next read is due — the same pre-emptive rule a spent usage window follows, so a key that
+   * cannot pay is never chosen for a new conversation. Only the cached balance is read: this is the
+   * request path, and a turn must not wait on a balance lookup (that is `/api/provider-keys` and
+   * `/api/limits`). A read that finds money again releases the key before the next pick.
+   */
+  private parkEmptyBalanceKeys(name: string, provider: { type: string; url?: string }, credentials: readonly Credential[]): void {
+    if (!this.creditVendorOf(provider)) return;
+    for (const credential of credentials) {
+      if (credential.paused) continue;
+      const known = this.creditBalances.peek(`${name}/${credential.id}`);
+      if (!known) continue;
+      if (known.remaining_usd > 0) this.pool.releaseEmpty(name, credential.id);
+      else this.parkEmptyBalance(name, credential.id);
+    }
+  }
+
+  /**
    * Park every OpenCode Go key whose last usage snapshot shows a full window (5-hour, weekly or
    * monthly) until that window resets — the same rule a ChatGPT account at 100% follows, so a key
    * that is spent is never picked for a new conversation. Only the cached snapshot is read: this is
@@ -1895,52 +1999,94 @@ export class Proxy {
   }
 
   /**
-   * One OpenCode Go provider's keys as the dashboard's account cards show them, in configured order:
-   * id, label, state and windows — never a header, which is what carries the key.
+   * Hold a key out of rotation because its prepaid balance read said nothing is left. The park lasts
+   * one balance-read period: that read is the only thing that can say money has come back, and until
+   * it answers, sending a new conversation to this key would only fail at the vendor.
+   */
+  private parkEmptyBalance(name: string, id: string): void {
+    this.pool.parkEmpty(name, id, Date.now() + this.creditBalances.ttlMs());
+  }
+
+  /**
+   * One provider's keys as the dashboard's account cards show them, in configured order: id, label,
+   * state, and whatever this provider publishes about the key — usage windows for OpenCode Go, a
+   * prepaid balance for a credit vendor, nothing for the rest. Never a header, which is what carries
+   * the key.
    *
    * "in-use" is the key a new conversation would go to right now (the first usable one, because the
    * list order is the priority), so after a window resets it is key 1 again without anything having
    * to move a conversation back.
    *
-   * A read that fails keeps the last good windows (the reader never blanks them), and a key whose
-   * usage has never been read is `unknown` rather than "standby": the dashboard must not present a
-   * key it knows nothing about as one that is fine.
+   * A key whose usage has never been read is `unknown` rather than "standby": the dashboard must not
+   * present a key it knows nothing about as one that is fine. Only OpenCode Go has a usage read at
+   * all, so only there can a key be unknown; everywhere else the pool's own health is the whole
+   * story.
    */
-  async opencodeAccounts(name: string): Promise<OpenCodeAccountState[]> {
+  async providerKeys(name: string): Promise<ProviderKeyState[]> {
     const cfg = this.deps.config().providers[name];
-    if (!cfg || cfg.type !== "openai-compatible" || !isOpenCodeGo(cfg)) return [];
+    if (!cfg || !isKeyProvider(cfg)) return [];
     const credentials = this.credentialsOf(name, cfg);
-    // Read every key's usage before deciding states: this is the dashboard, where waiting for the
-    // answer is the point, and the snapshots it fills are what the request path then reads.
-    const windows = await Promise.all(credentials.map((credential) =>
-      this.opencodeUsage.windows(`${name}/${credential.id}`, cfg.url, credential.headers)));
+    const opencode = isOpenCodeGo(cfg) && cfg.type === "openai-compatible";
+    const vendor = this.creditVendorOf(cfg);
+    // Read what this provider publishes before deciding states: this is the dashboard, where waiting
+    // for the answer is the point, and the snapshots it fills are what the request path then reads.
+    const windows = opencode
+      ? await Promise.all(credentials.map((credential) => this.opencodeUsage.windows(`${name}/${credential.id}`, (cfg as { url: string }).url, credential.headers)))
+      : credentials.map((): OpenCodeWindow[] => []);
+    const credits = vendor
+      ? await Promise.all(credentials.map((credential) => {
+        const cacheKey = `${name}/${credential.id}`;
+        return this.creditBalances.balance(cacheKey, vendor, credential.headers).then((balance) => ({ balance, at: this.creditBalances.readAt(cacheKey) }));
+      }))
+      : credentials.map(() => ({ balance: null, at: 0 }));
     // Park from the answer just read rather than starting a second lookup per key: the dashboard
     // already waited for this one, and a background read of the same key would only race it.
     const now = Date.now();
     credentials.forEach((credential, index) => {
       if (credential.paused) return;
-      const reset = spentWindowReset(windows[index]!, now);
-      if (reset !== null) this.pool.coolUntil(name, credential.id, reset);
+      if (opencode) {
+        const reset = spentWindowReset(windows[index]!, now);
+        if (reset !== null) this.pool.coolUntil(name, credential.id, reset);
+      }
+      const balance = credits[index]?.balance;
+      if (!balance) return;
+      if (balance.remaining_usd > 0) this.pool.releaseEmpty(name, credential.id);
+      else this.parkEmptyBalance(name, credential.id);
     });
     const chosen = this.pool.pick(name, credentials);
     const reports = this.pool.report(name, credentials);
     return credentials.map((credential, index) => {
       const report = reports[index]!;
-      const readAt = this.opencodeUsage.readAt(`${name}/${credential.id}`);
-      const state: OpenCodeAccountState["state"] = report.state === "paused" || report.state === "quarantined"
+      const readAt = opencode ? this.opencodeUsage.readAt(`${name}/${credential.id}`) : credits[index]?.at ?? 0;
+      const state: ProviderKeyState["state"] = report.state === "paused" || report.state === "quarantined"
         ? report.state
         : report.state === "cooling" ? "cooling"
-        : readAt === 0 ? "unknown" // never read: nothing has been said about this key yet
+        : opencode && readAt === 0 ? "unknown" // never read: nothing has been said about this key yet
         : chosen?.id === credential.id ? "in-use" : "standby";
+      const credit = credits[index]?.balance;
       return {
         id: credential.id,
         ...(credential.label ? { label: credential.label } : {}),
         state,
         ...(report.cooldownSeconds !== undefined ? { cooldown_seconds: report.cooldownSeconds } : {}),
         at: readAt,
-        windows: windows[index]!,
+        windows: opencode ? windows[index]! : [],
+        ...(credit ? { credit: { remaining_usd: credit.remaining_usd, low: credit.low, ...(credit.days_remaining !== undefined ? { days_remaining: credit.days_remaining } : {}) } } : {}),
       };
     });
+  }
+
+  /** OpenCode Go's account cards, kept for the old endpoint's shape (same rows, usage only). */
+  async opencodeAccounts(name: string): Promise<OpenCodeAccountState[]> {
+    const rows = await this.providerKeys(name);
+    return rows.map((row) => ({
+      id: row.id,
+      ...(row.label ? { label: row.label } : {}),
+      state: row.state,
+      ...(row.cooldown_seconds !== undefined ? { cooldown_seconds: row.cooldown_seconds } : {}),
+      at: row.at,
+      windows: row.windows,
+    }));
   }
 
   /**

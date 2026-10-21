@@ -180,6 +180,45 @@ test("cooling until a stated reset leaves a longer cooldown alone, and a shorter
   assert.equal(pool.pick("p", all)?.id, "a");
 });
 
+// A prepaid key that cannot pay is not a failure the vendor reported: nothing is wrong with it, it
+// just has no money until someone tops it up. It rests the way a cooling key does, but a later
+// balance read — the only thing that can say money came back — is what lets it in again.
+test("a key parked for an empty balance is skipped, reported as cooling, and released by a later read", () => {
+  const c = clock();
+  const pool = new CredentialPool({ now: c.now });
+  const all = creds("a", "b");
+  const parkMs = 300_000;
+  pool.parkEmpty("p", "a", c.now() + parkMs);
+
+  assert.equal(pool.pick("p", all, "conv")?.id, "b", "a zero balance is skipped like a cooldown");
+  assert.equal(pool.hasUsable("p", [all[0]!]), false);
+  const [a] = pool.report("p", all);
+  assert.equal(a?.state, "cooling", "the dashboard shows it resting");
+  assert.equal(a?.cooldownSeconds, parkMs / 1000, "for one balance-read period");
+  assert.equal(a?.failures, 0, "nothing failed — it is spent, not rejected");
+  assert.equal(pool.emptySince("p", "a"), c.now() + parkMs);
+
+  // A vendor's own cooldown on the same key is not shortened by a topped-up balance: the two are
+  // separate reasons to rest a key, and releasing one leaves the other standing.
+  pool.penalise("p", "a", 429, 60_000);
+  pool.releaseEmpty("p", "a");
+  assert.equal(pool.report("p", all)[0]?.state, "cooling", "the vendor's cooldown still stands");
+  assert.equal(pool.emptySince("p", "a"), 0, "the balance park is gone");
+  c.advance(61_000);
+  // A new conversation, because "conv" is still held on the key that answered it (that is its cache).
+  assert.equal(pool.pick("p", all, "conv-2")?.id, "a", "with money and no cooldown it is first again");
+
+  // The operator's "use again" releases a balance park as well, per key and for the whole provider.
+  pool.parkEmpty("p", "a", c.now() + parkMs);
+  pool.clear("p", "a");
+  assert.equal(pool.pick("p", all, "conv-3")?.id, "a");
+  pool.parkEmpty("p", "a", c.now() + parkMs);
+  pool.parkEmpty("p", "b", c.now() + parkMs);
+  assert.equal(pool.pick("p", all, "conv-3"), null, "every key resting leaves nothing to pick");
+  pool.clear("p");
+  assert.equal(pool.pick("p", all, "conv-3")?.id, "a");
+});
+
 test("an operator can un-park a credential without restarting the router", () => {
   const pool = new CredentialPool();
   const all = creds("a", "b");
