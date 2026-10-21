@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { ConfigStore, DEFAULTS, providerFor, validate } from "../src/config.ts";
+import { ConfigStore, DEFAULTS, headersWithCredential, providerFor, validate } from "../src/config.ts";
 import type { AnthropicCompatibleProvider, Config, GoogleProvider, OpenAiCompatibleProvider } from "../src/config.ts";
 import { Logger } from "../src/log.ts";
 
@@ -274,6 +274,41 @@ test("a google-wire model takes the key from the credential pool after a headers
   }, "gemini-4-argon-contributor") as GoogleProvider;
   assert.equal(onlyPaused.apiKey, "sk-second");
   assert.equal((providerFor({ ...provider, apiKey: "sk-own" } as unknown as OpenAiCompatibleProvider, "gemini-4-argon-contributor") as GoogleProvider).apiKey, "sk-own");
+});
+
+// Adding a key moves a provider's only key into `credentials`, leaving `headers` with whatever else
+// the provider needed. Every path that made its own request read `headers` alone and went out
+// unauthenticated — the connection test, the OpenAI ingress, a capability measurement, a search side
+// request — which read to the user as a working provider whose key was rejected (2026-10-21).
+test("a request of the router's own takes its key from the pool when headers carry none", () => {
+  const provider = {
+    headers: { "x-extra": "kept" },
+    credentials: [
+      { id: "default", label: "Paused", headers: { authorization: "Bearer sk-paused" }, paused: true },
+      { id: "key-1", label: "Work", headers: { authorization: "Bearer sk-first", "x-org": "acme" } },
+      { id: "key-2", headers: { authorization: "Bearer sk-second" } },
+    ],
+  };
+  assert.deepEqual(headersWithCredential(provider), {
+    "x-extra": "kept",
+    authorization: "Bearer sk-first",
+    "x-org": "acme",
+  }, "the first non-paused key, and the provider's other headers with it");
+  // The first usable one only: a probe does not round-robin.
+  assert.equal(headersWithCredential(provider)!.authorization, "Bearer sk-first");
+
+  // A key in `headers` is still exactly what goes out, and a provider with no pool is untouched.
+  const inline = { headers: { authorization: "Bearer sk-inline", "x-extra": "kept" }, credentials: provider.credentials };
+  assert.equal(headersWithCredential(inline), inline.headers, "the unmigrated shape is answered by identity");
+  assert.deepEqual(headersWithCredential({ headers: { "x-extra": "kept" } }), { "x-extra": "kept" }, "nothing usable leaves the headers as they were");
+  assert.equal(headersWithCredential({ credentials: provider.credentials })!.authorization, "Bearer sk-first", "no provider headers at all still authenticates");
+
+  // A caller that knows what is resting can take the paused key out of the rotation it sees.
+  const readyOnly = headersWithCredential(
+    { ...provider, credentials: [{ id: "key-1", headers: { authorization: "Bearer sk-cooling" } }, ...provider.credentials.slice(1)] },
+    (credential) => credential.id !== "key-1",
+  );
+  assert.equal(readyOnly!.authorization, "Bearer sk-second", "an excluded key is skipped, not retried");
 });
 
 test("validate accepts a google-wire model and a google provider's sessionHeader/headers", () => {

@@ -33,8 +33,8 @@ import path from "node:path";
 import http from "node:http";
 import { execFile, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import type { Config, Provider, ProviderModel } from "./config.ts";
-import { adminPort, authConventionOf, headerValueProblem, homeDir, isKeyProvider, searchProviderFor, ssidProblem, validate } from "./config.ts";
+import type { Config, Provider, ProviderCredential, ProviderModel } from "./config.ts";
+import { adminPort, authConventionOf, headerValueProblem, headersWithCredential, homeDir, isKeyProvider, searchProviderFor, ssidProblem, validate } from "./config.ts";
 export { adminPort } from "./config.ts";
 import { generatedAgents } from "./agents.ts";
 import { isJudgeOnlyModel } from "./model-policy.ts";
@@ -582,6 +582,13 @@ type ProbeRequest = {
   type: "anthropic-compatible" | "openai-compatible";
   url: string;
   headers?: Record<string, string>;
+  /**
+   * The saved provider this test is for. Adding a key moves a headers-only key into `credentials`,
+   * so a test that read the form's headers alone went out unauthenticated and reported a working
+   * provider as "API key needed" (2026-10-21). The key is resolved from the router's own copy of the
+   * provider rather than from this request, so a paused or quarantined key is never tested.
+   */
+  name?: string;
   modelsUrl?: string;
   modelsAuthHeader?: string;
   /** Model id to use for the auth check when the provider has no listing endpoint (e.g. the preset's first fallback). */
@@ -1547,8 +1554,64 @@ function presetProbeModel(presetId: string | undefined): string | undefined {
   return preset.fallbackModels.find((model) => (model.wire ?? preset.wire ?? "chat") === "chat")?.id;
 }
 
-async function probeProvider(body: ProbeRequest, probeFetch: (url: string, init: RequestInit) => Promise<Response> = fetchWithTimeout): Promise<{ ok: boolean; auth: ProbeAuth; models: ModelEntry[]; error?: string }> {
-  const source = headerValue(body.headers);
+/**
+ * The headers a request of the router's own (a connection test, a capability measurement)
+ * authenticates with, when the provider's key may live in its pool.
+ *
+ * Adding a key moves a headers-only key into `credentials` (`addProviderKey`), so from then on
+ * `headers` authenticates nothing. A test that read `headers` alone went out with no credential and
+ * reported a working provider as one whose key was refused — OpenCode Go answered "HTTP 401 ·
+ * Upstream request failed: Go requires a credential" while every routed turn succeeded
+ * (2026-10-21). The key is resolved the way a turn resolves it: the first credential in configured
+ * order that is not paused and not quarantined. A probe never moves on to a second one (that would
+ * be round-robin, not a test) and never charges any of them.
+ *
+ * A key the caller supplies itself — one typed into the form — is the thing under test and wins.
+ * A provider with no pool is answered exactly as before.
+ *
+ * `resting` is set when the provider has a pool and nothing in it may be sent. The caller then
+ * reports that plainly instead of making a request that would come back 401 and read as "your key is
+ * bad" when the truth is that the operator parked them.
+ */
+function selfRequestHeaders(
+  deps: AdminDeps,
+  name: string | undefined,
+  headers: Record<string, string> | undefined,
+): { headers?: Record<string, string>; resting?: string } {
+  const provider = name ? deps.config().providers[name] : undefined;
+  if (!provider || !isKeyProvider(provider)) return headers ? { headers } : {};
+  if (headers && headerValue(headers)) return { headers };
+  const credentials = provider.credentials ?? [];
+  if (credentials.length === 0) {
+    const saved = provider.headers;
+    const merged = headers ?? saved;
+    return merged ? { headers: merged } : {};
+  }
+  const states = new Map((name ? deps.credentials?.()?.[name] ?? [] : []).map((entry) => [entry.id, entry.state]));
+  // Cooling is a rate limit, not a statement about the key, so a test may still use one. Paused is
+  // the operator's decision and quarantined is a refusal already earned; neither is a candidate.
+  const usable = (credential: ProviderCredential): boolean => {
+    const state = states.get(credential.id);
+    return state === undefined || state === "ready" || state === "cooling";
+  };
+  const merged = headersWithCredential({ headers: { ...provider.headers, ...headers }, credentials }, usable);
+  if (merged && headerValue(merged)) return { headers: merged };
+  // Nothing usable: name the reason rather than send a request that can only answer 401.
+  const parked = credentials.filter((credential) => !credential.paused && states.get(credential.id) === "quarantined").length;
+  const resting = credentials.every((credential) => credential.paused)
+    ? `${name} has no key in rotation: every key is paused. Resume one in the dashboard, then check again.`
+    : parked > 0
+      ? `${name} has no key in rotation: every key is quarantined after a refusal. Clear one in the dashboard, then check again.`
+      : `${name} has no usable key: its keys carry no authentication header.`;
+  return { ...(merged ? { headers: merged } : {}), resting };
+}
+
+async function probeProvider(body: ProbeRequest, deps: AdminDeps, probeFetch: (url: string, init: RequestInit) => Promise<Response> = fetchWithTimeout): Promise<{ ok: boolean; auth: ProbeAuth; models: ModelEntry[]; error?: string }> {
+  const resolved = selfRequestHeaders(deps, body.name, body.headers);
+  // A pool with nothing in rotation is reported as its own answer: no request is made, so nothing is
+  // charged and the operator is told what to do rather than that a working key failed.
+  if (resolved.resting) return { ok: false, auth: "missing", models: [], error: resolved.resting };
+  const source = headerValue(resolved.headers);
   let models: ModelEntry[] = [];
   let modelsError: string | undefined;
   if (body.modelsUrl) {
@@ -1904,7 +1967,9 @@ async function runMeasureJob(jobId: string, providerName: string, models: string
   // effort at all (`discoverLadder`), rather than leave it stripped.
   const discover = effortUndeclared(provider);
   const fetchImpl = deps.measureFetch ?? measureFetchWithTimeout;
-  const headers = "headers" in provider ? provider.headers : undefined;
+  // The key may be in the pool rather than in `headers` (adding one migrates it there), and a
+  // measurement sent without it measured the vendor's 401 as the model's capability.
+  const headers = selfRequestHeaders(deps, providerName, undefined).headers;
   const sessionHeader = "sessionHeader" in provider ? provider.sessionHeader : undefined;
   const preset = "preset" in provider ? provider.preset : undefined;
   const catalog = deps.modelCatalog ? await deps.modelCatalog().catch(() => undefined) : undefined;
@@ -2457,6 +2522,7 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
         const result = await probeProvider({
           type: probe.type,
           url: probe.url,
+          ...(typeof probe.name === "string" && probe.name ? { name: probe.name } : {}),
           ...(probe.headers ? { headers: probe.headers as Record<string, string> } : {}),
           ...(probe.modelsUrl ? { modelsUrl: probe.modelsUrl } : {}),
           ...(typeof probe.sessionHeader === "string" && probe.sessionHeader ? { sessionHeader: probe.sessionHeader } : {}),
@@ -2464,7 +2530,7 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
           ...(typeof probe.preset === "string" && probe.preset ? { preset: probe.preset } : {}),
           ...(typeof probe.probeModel === "string" ? { probeModel: probe.probeModel } : {}),
           ...(probe.wire === "chat" || probe.wire === "responses" ? { wire: probe.wire } : {}),
-        }, deps.probeModelFetch ?? fetchWithTimeout);
+        }, deps, deps.probeModelFetch ?? fetchWithTimeout);
         sendJson(res, 200, result);
         return;
       }

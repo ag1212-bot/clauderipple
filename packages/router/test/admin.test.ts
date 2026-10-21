@@ -1103,6 +1103,133 @@ test("POST /api/providers/probe reports 401 as a bad key without exposing it", a
   }
 });
 
+// Adding a key moves a provider's only key out of `headers` and into `credentials[0]` on the first
+// POST /api/provider-keys. The connection test read the form's headers alone, went out with no
+// credential, and reported a working provider as "API key needed" — OpenCode Go answered "HTTP 401 ·
+// Upstream request failed: Go requires a credential" while every routed turn succeeded (2026-10-21).
+test("the connection test uses a key that lives only in the credential pool", async () => {
+  const seen: { path?: string | undefined; auth?: string | undefined; apiKey?: string | undefined; models?: string | undefined } = {};
+  const upstream = http.createServer((req, res) => {
+    seen.path = req.url;
+    if (req.url === "/v1/models") { seen.models = req.headers.authorization as string | undefined; res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ data: [{ id: "pooled-model" }] })); return; }
+    req.resume();
+    req.on("end", () => {
+      seen.auth = req.headers.authorization as string | undefined;
+      seen.apiKey = req.headers["x-api-key"] as string | undefined;
+      // The key really travels: only a request carrying it is answered.
+      if (req.headers.authorization !== "Bearer test-key-pooled") { res.writeHead(401, { "content-type": "application/json" }).end(JSON.stringify({ error: "Go requires a credential" })); return; }
+      res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ choices: [] }));
+    });
+  });
+  await new Promise<void>((resolveP) => upstream.listen(0, "127.0.0.1", resolveP));
+  const address = upstream.address();
+  assert.ok(address && typeof address === "object");
+  const cfg = makeCfg({
+    providers: {
+      "opencode-go": {
+        type: "openai-compatible",
+        url: `http://127.0.0.1:${address.port}/v1`,
+        // The key is in the pool, not here: this is what the migration leaves behind.
+        headers: { "x-extra": "kept" },
+        credentials: [
+          { id: "default", headers: { authorization: "Bearer test-key-paused" }, paused: true },
+          { id: "key-1", headers: { authorization: "Bearer test-key-pooled" } },
+        ],
+        models: [{ id: "pooled-model" }],
+      },
+    },
+  });
+  try {
+    await withAdmin(cfg, async ({ port }) => {
+      const res = await fetch(`${base()}:${port}/api/providers/probe`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        // The form's own headers carry no key: they are the provider's remaining extra headers.
+        body: JSON.stringify({ type: "openai-compatible", name: "opencode-go", url: `http://127.0.0.1:${address.port}/v1`, headers: { "x-extra": "kept" }, modelsUrl: `http://127.0.0.1:${address.port}/v1/models`, probeModel: "pooled-model" }),
+      });
+      assert.equal(res.status, 200);
+      const body = (await res.json()) as { ok: boolean; auth: string; models?: { id: string }[]; error?: string };
+      assert.equal(body.ok, true, `the pooled key was not used: ${body.error ?? ""}`);
+      assert.equal(body.auth, "ok");
+      assert.deepEqual(body.models, [{ id: "pooled-model" }], "the listing was read with the same key");
+      assert.equal(JSON.stringify(body).includes("test-key"), false, "no key value in the answer");
+    });
+    assert.equal(seen.auth, "Bearer test-key-pooled", "the first non-paused key answers the test");
+    assert.equal(seen.models, "Bearer test-key-pooled", "the listing call carries the same key");
+  } finally {
+    await new Promise<void>((resolveP, reject) => upstream.close((error) => (error ? reject(error) : resolveP())));
+  }
+});
+
+// The same test on a headers-only provider must behave exactly as it always did.
+test("the connection test on a headers-only provider is unchanged", async () => {
+  const seen: { models?: string | undefined; auth?: string | undefined } = {};
+  const upstream = http.createServer((req, res) => {
+    if (req.url === "/v1/models") { seen.models = req.headers.authorization as string | undefined; res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ data: [{ id: "m" }] })); return; }
+    req.resume();
+    req.on("end", () => { seen.auth = req.headers.authorization as string | undefined; res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ choices: [] })); });
+  });
+  await new Promise<void>((resolveP) => upstream.listen(0, "127.0.0.1", resolveP));
+  const address = upstream.address();
+  assert.ok(address && typeof address === "object");
+  const cfg = makeCfg({ providers: { plain: { type: "openai-compatible", url: `http://127.0.0.1:${address.port}/v1`, headers: { authorization: "Bearer test-key-headers" }, models: [{ id: "m" }] } } });
+  try {
+    await withAdmin(cfg, async ({ port }) => {
+      const res = await fetch(`${base()}:${port}/api/providers/probe`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        // Not even named: a form draft with its own headers has to keep working by itself.
+        body: JSON.stringify({ type: "openai-compatible", url: `http://127.0.0.1:${address.port}/v1`, headers: { authorization: "Bearer test-key-headers" }, modelsUrl: `http://127.0.0.1:${address.port}/v1/models`, probeModel: "m" }),
+      });
+      assert.deepEqual(await res.json(), { ok: true, auth: "ok", models: [{ id: "m" }] });
+    });
+    assert.equal(seen.auth, "Bearer test-key-headers");
+    assert.equal(seen.models, "Bearer test-key-headers");
+  } finally {
+    await new Promise<void>((resolveP, reject) => upstream.close((error) => (error ? reject(error) : resolveP())));
+  }
+});
+
+// A pool with nothing in rotation is reported plainly and nothing is sent: a request without a key
+// can only come back 401, which reads as "the key is bad" when the operator is the one who parked it.
+test("the connection test on an all-paused pool reports plainly and calls no upstream", async () => {
+  let calls = 0;
+  const upstream = http.createServer((_req, res) => { calls += 1; res.writeHead(500).end(); });
+  await new Promise<void>((resolveP) => upstream.listen(0, "127.0.0.1", resolveP));
+  const address = upstream.address();
+  assert.ok(address && typeof address === "object");
+  const cfg = makeCfg({
+    providers: {
+      parked: {
+        type: "openai-compatible",
+        url: `http://127.0.0.1:${address.port}/v1`,
+        credentials: [
+          { id: "key-1", headers: { authorization: "Bearer test-key-1" }, paused: true },
+          { id: "key-2", headers: { authorization: "Bearer test-key-2" }, paused: true },
+        ],
+        models: [{ id: "m" }],
+      },
+    },
+  });
+  try {
+    await withAdmin(cfg, async ({ port }) => {
+      const res = await fetch(`${base()}:${port}/api/providers/probe`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ type: "openai-compatible", name: "parked", url: `http://127.0.0.1:${address.port}/v1`, headers: {}, modelsUrl: `http://127.0.0.1:${address.port}/v1/models`, probeModel: "m" }),
+      });
+      assert.equal(res.status, 200);
+      const body = (await res.json()) as { ok: boolean; auth: string; error?: string };
+      assert.equal(body.ok, false);
+      assert.equal(body.auth, "missing", "not bad-key: no key was tested, so none failed");
+      assert.match(body.error ?? "", /paused/i);
+      assert.equal(calls, 0, "nothing was sent, so no key could be charged");
+    });
+  } finally {
+    await new Promise<void>((resolveP, reject) => upstream.close((error) => (error ? reject(error) : resolveP())));
+  }
+});
+
 test("POST /api/providers/probe does not call an upstream 500 authenticated", async () => {
   const upstream = http.createServer((_req, res) => res.writeHead(500).end("failure"));
   await new Promise<void>((resolveP) => upstream.listen(0, "127.0.0.1", resolveP));
@@ -1880,6 +2007,44 @@ test("POST /api/providers/measure runs in the background and polling settles the
     // `medium` and `high` are in although the provider declared neither: a measurement corrects the
     // configuration in both directions, or a level the plan really offers stays out of reach.
     assert.deepEqual(onDisk.providers.oc?.models?.[0]?.effortLevels, ["none", "low", "medium", "high"]);
+  }, { measureFetch });
+});
+
+// A measurement makes its own requests, so a key that lives only in the pool had to be resolved the
+// same way a turn resolves it: measured with no credential at all, the vendor's 401 was recorded as
+// the model's capability (2026-10-21).
+test("a measurement authenticates with a key that lives only in the credential pool", async () => {
+  const cfg = makeCfg({
+    providers: {
+      pooled: {
+        type: "openai-compatible",
+        url: "http://127.0.0.1:9/v1",
+        wire: "chat",
+        headers: { "x-extra": "kept" },
+        credentials: [
+          { id: "default", headers: { authorization: "Bearer test-key-paused" }, paused: true },
+          { id: "key-1", headers: { authorization: "Bearer test-key-pooled" } },
+        ],
+        models: [{ id: "pooled-model" }],
+      },
+    },
+  });
+  const seen: string[] = [];
+  const measureFetch = (async (_url: string, init: RequestInit): Promise<Response> => {
+    const auth = new Headers(init.headers).get("authorization") ?? "";
+    seen.push(auth);
+    return new Response("{}", { status: auth === "Bearer test-key-pooled" ? 200 : 401 });
+  }) as unknown as typeof fetch;
+  await withAdmin(cfg, async ({ port }) => {
+    const started = await fetch(`${base()}:${port}/api/providers/measure`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ provider: "pooled", models: ["pooled-model"] }),
+    });
+    assert.equal(started.status, 202);
+    const job = await pollMeasure(port, ((await started.json()) as { jobId: string }).jobId);
+    assert.equal(job.state, "done");
+    const [result] = job.results as { id: string; wire?: string }[];
+    assert.deepEqual([result!.id, result!.wire], ["pooled-model", "chat"], "measured as working, because the pooled key answered");
+    assert.ok(seen.length > 0 && seen.every((auth) => auth === "Bearer test-key-pooled"), `every measurement carried the pooled key: ${JSON.stringify(seen)}`);
   }, { measureFetch });
 });
 

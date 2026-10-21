@@ -2188,11 +2188,14 @@ async function saveSlots() {
 
 // ---- Providers ----------------------------------------------------------------------
 
-async function probeProvider(name, provider, onComplete) {
+async function probeProvider(name, provider, onComplete, savedName) {
   probeStates.set(name, { pending: true });
   renderHealthProviders();
   try {
     const headers = provider.headers || {};
+    // The saved provider whose key pool the router should resolve the check's key from. `name` is a
+    // UI state key and can be temporary (a draft), so it is never sent.
+    const providerName = savedName || (name && !String(name).startsWith("__new_") ? name : undefined);
     const body = provider.type === "anthropic"
       ? { type: "anthropic", auth: provider.auth, ...(provider.auth === "api-key" && provider.apiKey ? { apiKey: provider.apiKey } : {}) }
       : provider.type === "google"
@@ -2202,6 +2205,9 @@ async function probeProvider(name, provider, onComplete) {
       : {
         type: provider.type,
         url: provider.url,
+        // With several keys the key lives in `credentials`, not in `headers` (adding one migrates
+        // it), so the router resolves the check's key from its own copy of the provider.
+        ...(providerName ? { name: providerName } : {}),
         headers,
         modelsUrl: provider.modelsUrl || (provider.preset && presetById(provider.preset) && presetById(provider.preset).modelsUrl),
         modelsAuthHeader: provider.modelsAuthHeader || (provider.preset && presetById(provider.preset) && presetById(provider.preset).modelsAuthHeader),
@@ -4077,7 +4083,10 @@ function openProviderForm(options) {
     probeButton.disabled = true;
     result.textContent = t("providers.checking");
     const temporary = `__new_${Date.now()}`;
-    const response = await probeProvider(temporary, draft);
+    // A draft is still reported under a temporary state key, but it is the saved provider's settings
+    // being tested, so the router is told which one: with several keys the key lives in `credentials`
+    // and only the router's own copy of the provider has it.
+    const response = await probeProvider(temporary, draft, undefined, existing ? options.name : undefined);
     probeButton.disabled = false;
     const noCredits = response.ok && /^no-credits:/.test(response.error || "");
     const headline = noCredits ? t("providers.probeNoCredits") : response.ok ? t("providers.probeOk") : response.auth === "not-entitled" ? t("providers.probeNotEntitled") : response.auth === "bad-key" ? t("providers.probeBadKey") : response.unavailable ? t("providers.apiSoon") : t("providers.probeFailed");
