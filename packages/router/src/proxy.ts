@@ -545,6 +545,39 @@ export class Proxy {
   }
 
   /**
+   * Re-read the balance of every credit-selling key whose last read said nothing is left, so a key
+   * topped up while nobody has the dashboard (or `/api/limits`) open comes back by itself. The
+   * request path only reads the cached balance, and a cached zero re-parks a key on every turn — so
+   * without this, a topped-up key would stay out of rotation until someone opened the GUI.
+   *
+   * Cheap by construction: it proceeds only while a key is parked, and it reads only those keys —
+   * one forced read per parked key, at the timer's five-minute pace, and never for a funded or
+   * paused one. The timer that calls it lives in index.ts, never on the request path.
+   */
+  async refreshParkedBalances(): Promise<void> {
+    for (const [name, provider] of Object.entries(this.deps.config().providers)) {
+      const vendor = this.creditVendorOf(provider);
+      if (!vendor) continue;
+      const credentials = this.credentialsOf(name, provider);
+      const parked = credentials.filter((credential) => {
+        if (credential.paused) return false;
+        const known = this.creditBalances.peek(`${name}/${credential.id}`);
+        return known !== undefined && known.remaining_usd <= 0;
+      });
+      await Promise.all(parked.map(async (credential) => {
+        const cacheKey = `${name}/${credential.id}`;
+        // A forced read: the cached zero is what parked this key, so the cache cannot be the answer.
+        const balance = await this.creditBalances.refresh(cacheKey, vendor, credential.headers);
+        if (!balance) return;
+        if (balance.remaining_usd > 0) {
+          if (this.pool.emptySince(name, credential.id) > 0) this.deps.log.info(`credit balance ${cacheKey}: money is back, key released`);
+          this.pool.releaseEmpty(name, credential.id);
+        } else this.parkEmptyBalance(name, credential.id);
+      }));
+    }
+  }
+
+  /**
    * One credit-selling provider's balance, for callers that still want a single figure (the CLI's
    * status line). The first key that has a readable balance answers.
    */

@@ -1286,9 +1286,11 @@ shown as zero.
   rotation for one read period (`pool.parkEmpty`, separate from cooldown/quarantine
   health so a later read can release it without erasing a vendor's own cooldown). It
   reports as `cooling` on `/api/provider-keys`, and a later read that finds money
-  releases it — so a top-up comes back on the dashboard's next poll, no restart.
-  The request path only ever reads the cached balance: a turn never waits on a
-  vendor lookup.
+  releases it — a top-up comes back on the dashboard's next poll, and on the router's
+  own five-minute re-read (`refreshParkedBalances`, a timer in `index.ts`) even with
+  the GUI closed. That re-read is forced past the reader's cache and asks only for
+  keys already parked, so it costs nothing while every key is funded. The request
+  path only ever reads the cached balance: a turn never waits on a vendor lookup.
 
 - **sail** (`api.sailresearch.com`): `GET /v2/usage/summary?range=30d` with the
   provider's own auth header. `balance` is in **fractional USD cents**, so 73795 is

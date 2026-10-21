@@ -566,7 +566,62 @@ test("an anthropic-compatible provider's empty-balance key is skipped too", asyn
   } finally { await r.stop(); await up.close(); }
 });
 
-// The key the user pastes into the GUI has to be the key the very next turn carries. The config is
+// A key parked on a balance of zero used to come back only when someone opened the dashboard or
+// something asked `/api/limits`: the request path reads the cached zero and re-parks the key, so a
+// top-up during a day of work with the GUI closed left it out of rotation for good. The router's own
+// five-minute re-read is what makes the top-up reach it — no dashboard, no restart, no request to a
+// key the router believes is empty.
+test("a topped-up key is released by the router's own re-read, with no dashboard open", async () => {
+  const up = await upstream(() => answer("ok"));
+  let left = 0; // the first key starts empty; a top-up changes only what the vendor answers for it
+  const creditFetch = async (_url: string, init?: RequestInit): Promise<Response> => {
+    const auth = String((init?.headers as Record<string, string>)?.authorization ?? "");
+    const remaining = auth === "Bearer test-key-1" ? left : 12;
+    return new Response(JSON.stringify({ data: { total_credits: 100, total_usage: 100 - remaining } }), { status: 200 });
+  };
+  // An hour of cache: the cached zero cannot expire during this test, so only a forced re-read can
+  // find the money. That is exactly the production shape (a five-minute cache, a five-minute timer).
+  const r = await rig({ p: pooled(up.port) }, routes, { creditFetch, creditTtlMs: 3_600_000, creditVendor: () => "openrouter" });
+  try {
+    assert.deepEqual((await r.proxy.creditLimits("p")).map((row) => row.credit.remaining_usd), [0, 12], "key-1 is read as empty");
+    // With key-1 parked and nothing else asking for a balance, a turn goes to key-2.
+    assert.equal(await r.send("conv-1"), 200);
+    assert.deepEqual(up.keys, ["Bearer test-key-2"], "the empty key is skipped");
+
+    left = 40;
+    // The turn before the re-read still reads the cached zero: the key stays parked.
+    assert.equal(await r.send("conv-2"), 200);
+    assert.deepEqual(up.keys, ["Bearer test-key-2", "Bearer test-key-2"], "the cache alone cannot release it");
+
+    await r.proxy.refreshParkedBalances();
+    const after = await r.proxy.providerKeys("p");
+    assert.deepEqual(after.map((row) => [row.id, row.state, row.credit?.remaining_usd]), [["key-1", "in-use", 40], ["key-2", "standby", 12]], "the re-read found the money and released the key");
+
+    assert.equal(await r.send("conv-3"), 200);
+    assert.equal(up.keys.at(-1), "Bearer test-key-1", "a new conversation starts on the released key again");
+  } finally { await r.stop(); await up.close(); }
+});
+
+// The re-read is cheap: with nothing parked it must not call the vendor at all, and it must not
+// spend a read on a key that is merely healthy.
+test("the parked-balance re-read asks the vendor nothing when no key is parked", async () => {
+  const up = await upstream(() => answer("ok"));
+  let reads = 0;
+  const creditFetch = async (): Promise<Response> => {
+    reads++;
+    return new Response(JSON.stringify({ data: { total_credits: 100, total_usage: 0 } }), { status: 200 });
+  };
+  const r = await rig({ p: pooled(up.port) }, routes, { creditFetch, creditTtlMs: 3_600_000, creditVendor: () => "openrouter" });
+  try {
+    await r.proxy.refreshParkedBalances();
+    assert.equal(reads, 0, "nothing parked, so no balance read at all");
+    // One read fills the cache with money; the re-read still must not ask again.
+    await r.proxy.creditLimits("p");
+    const filled = reads;
+    await r.proxy.refreshParkedBalances();
+    assert.equal(reads, filled, "a funded key is not re-read");
+  } finally { await r.stop(); await up.close(); }
+});
 // written through the admin endpoint and picked up by mtime, which is the path a `config()` closure
 // in a test would hide.
 test("a key added through POST /api/provider-keys is used by the next request without a restart", async () => {

@@ -19,7 +19,8 @@
 // management key, so the provider's own key is what is sent.
 //
 // Only the status is ever logged: a balance is money, and the key that asked for it stays where it
-// already was. Nothing here runs on the request path — `/api/limits` is the only caller.
+// already was. Nothing here runs on the request path: `/api/limits`, the key cards and the router's
+// five-minute re-read of parked keys are the only callers.
 
 import type { FetchLike } from "./google/antigravity.ts";
 
@@ -122,9 +123,22 @@ export class CreditBalances {
 
   /** The provider's balance, cached for `ttlMs`; the last good one survives a failed read. */
   balance(name: string, vendor: CreditVendor, headers: Record<string, string>): Promise<CreditBalance | null> {
+    return this.read(name, vendor, headers, false);
+  }
+
+  /**
+   * The next read even when the cached one is still fresh. For the parked-key re-read: a key is held
+   * out for exactly one cache period, and asking for the same cached "nothing left" would never be
+   * able to release it. Still one read at a time per key.
+   */
+  refresh(name: string, vendor: CreditVendor, headers: Record<string, string>): Promise<CreditBalance | null> {
+    return this.read(name, vendor, headers, true);
+  }
+
+  private read(name: string, vendor: CreditVendor, headers: Record<string, string>, force: boolean): Promise<CreditBalance | null> {
     const now = (this.opts.now ?? Date.now)();
     const ttl = this.opts.ttlMs ?? 5 * 60_000;
-    if (now - (this.at.get(name) ?? Number.NEGATIVE_INFINITY) < ttl) return Promise.resolve(this.last.get(name) ?? null);
+    if (!force && now - (this.at.get(name) ?? Number.NEGATIVE_INFINITY) < ttl) return Promise.resolve(this.last.get(name) ?? null);
     const running = this.inFlight.get(name);
     if (running) return running;
     const task = this.fetchOne(name, vendor, headers).finally(() => {

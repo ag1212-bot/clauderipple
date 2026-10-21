@@ -197,6 +197,14 @@ setInterval(() => {
   log!.info(`stats proxy=${s.started}/${s.completed}/${s.failed} inFlight=${s.inFlight} ingress=${oi.started}/${oi.completed}/${oi.failed} inFlight=${oi.inFlight} consecutiveUpstreamFailures=${health.consecutiveFailures}`);
 }, statsEvery).unref();
 
+// A key parked on an empty prepaid balance is released only by a later balance read, and the only
+// reads used to be `/api/limits` and the dashboard. Left to those, a topped-up key stayed out of
+// rotation for as long as nobody opened the GUI. This asks again every five minutes, and the method
+// itself does nothing when no key is parked; a turn never waits on it.
+setInterval(() => {
+  void proxy.refreshParkedBalances().catch((e: Error) => log!.warn(`credit balance refresh: ${e.message}`));
+}, 5 * 60_000).unref();
+
 // The config callback above rewrites the Codex catalog when *our* models change; this covers
 // Codex's side (a new OpenAI model arriving in its cache).
 followCodexCache(() => ingressModels(store.get()), undefined, undefined, (e) => log!.warn(`codex catalog: ${e.message}`));
