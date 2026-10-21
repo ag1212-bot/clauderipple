@@ -4088,8 +4088,10 @@ function openProviderForm(options) {
   function probeDraft() {
     const d = draftProvider();
     // A saved provider keeps its keys in `credentials[]`, so the form has no auth header to send.
-    // The first usable key's header goes to the probe only; it is never placed in a field.
-    if (!isChatgpt && !authHeaderName(d.headers) && existing) {
+    // The first usable key's header goes to the probe only; it is never placed in a field. A named
+    // saved provider needs no borrow — the router resolves the check's key itself, so the key stays
+    // out of the request on this side.
+    if (!isChatgpt && !options.name && !authHeaderName(d.headers) && existing) {
       const borrowed = credentialAuthHeader(existing);
       if (borrowed) d.headers = { ...(d.headers || {}), [borrowed.name]: borrowed.value };
     }
