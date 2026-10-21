@@ -42,7 +42,7 @@ const DEFAULT_RATE_LIMIT_MS = 60_000;
 const TRANSIENT_MS = 10_000;
 const EXHAUSTED_MS = 30 * 60_000;
 /** A `Retry-After` beyond this is treated as "not within this session"; the credential is parked. */
-const MAX_COOLDOWN_MS = 6 * 60 * 60_000;
+export const MAX_COOLDOWN_MS = 6 * 60 * 60_000;
 
 /**
  * What an upstream status means for the credential that produced it. `retryAfterMs` comes from a
@@ -107,14 +107,14 @@ export function retryAfterMs(headers: Record<string, string | string[] | undefin
 }
 
 /** A single usable credential. `id` keys runtime health; `ownerId` identifies its durable account. */
-export type Credential = { id: string; headers: Record<string, string>; label?: string; ownerId?: string };
+export type Credential = { id: string; headers: Record<string, string>; label?: string; ownerId?: string; paused?: boolean };
 
 type Health = { cooldownUntil: number; quarantined: boolean; failures: number };
 
 export type CredentialReport = {
   id: string;
   label?: string;
-  state: "ready" | "cooling" | "quarantined";
+  state: "ready" | "cooling" | "quarantined" | "paused";
   /** Seconds until this credential is usable again; absent when it is ready or quarantined. */
   cooldownSeconds?: number;
   failures: number;
@@ -147,8 +147,11 @@ export class CredentialPool {
     return h;
   }
 
-  private usable(provider: string, id: string): boolean {
-    const h = this.healthOf(provider, id);
+  private usable(provider: string, credential: Credential): boolean {
+    // A paused credential is out of rotation by decision, not by failure, so it keeps its place in
+    // the list (and so its priority) while never being picked.
+    if (credential.paused) return false;
+    const h = this.healthOf(provider, credential.id);
     return !h.quarantined && h.cooldownUntil <= this.now();
   }
 
@@ -164,13 +167,13 @@ export class CredentialPool {
       const held = this.sticky.get(conversation);
       if (held && held.provider === provider) {
         const current = credentials.find((c) => (c.ownerId ?? c.id) === held.ownerId);
-        if (current && this.usable(provider, current.id)) {
+        if (current && this.usable(provider, current)) {
           held.at = this.now();
           return current;
         }
       }
     }
-    const next = credentials.find((c) => this.usable(provider, c.id));
+    const next = credentials.find((c) => this.usable(provider, c));
     if (!next) return null;
     if (conversation) this.sticky.set(conversation, { provider, ownerId: next.ownerId ?? next.id, at: this.now() });
     return next;
@@ -182,7 +185,17 @@ export class CredentialPool {
    * its fallback instead of failing once per request until the window resets.
    */
   hasUsable(provider: string, credentials: readonly Credential[]): boolean {
-    return credentials.some((c) => this.usable(provider, c.id));
+    return credentials.some((c) => this.usable(provider, c));
+  }
+
+  /**
+   * Park a credential until a known moment — a vendor's own quota window, which is a cooldown the
+   * vendor stated rather than one this router guessed. Never shortens a cooldown already running
+   * for a different reason.
+   */
+  coolUntil(provider: string, id: string, at: number): void {
+    const h = this.healthOf(provider, id);
+    if (h.cooldownUntil < at) h.cooldownUntil = at;
   }
 
   /** Record a failure. Returns the verdict so the caller can decide whether to try the next one. */
@@ -222,10 +235,13 @@ export class CredentialPool {
     return credentials.map((c) => {
       const h = this.healthOf(provider, c.id);
       const cooling = !h.quarantined && h.cooldownUntil > now;
+      // Paused before cooling and quarantine: the operator's own decision is the reason a key is
+      // out of rotation, and the dashboard should offer "resume" for it rather than "clear cooldown".
+      const state: CredentialReport["state"] = c.paused ? "paused" : h.quarantined ? "quarantined" : cooling ? "cooling" : "ready";
       return {
         id: c.id,
         ...(c.label ? { label: c.label } : {}),
-        state: h.quarantined ? "quarantined" : cooling ? "cooling" : "ready",
+        state,
         ...(cooling ? { cooldownSeconds: Math.ceil((h.cooldownUntil - now) / 1000) } : {}),
         failures: h.failures,
       };

@@ -52,6 +52,11 @@ export type ProviderCredential = {
   headers: Record<string, string>;
   /** Shown in the dashboard instead of the id. Not a secret, so keep the key out of it. */
   label?: string;
+  /**
+   * Set from the dashboard to take this key out of rotation without deleting it. A paused key is
+   * never picked, but stays in the list so its position (and so its priority) is kept.
+   */
+  paused?: boolean;
 };
 
 export type AnthropicCompatibleProvider = {
@@ -122,6 +127,13 @@ export type OpenAiCompatibleProvider = {
    * several times the tokens. Absent, nothing extra is sent.
    */
   sessionHeader?: string;
+  /**
+   * Further credentials for the same provider, tried when `headers` is rate limited or rejected.
+   * Each is a complete header set, and a conversation keeps whichever one it is on while that one is
+   * healthy — moving it moves the prompt cache with it. Absent, the provider has exactly the one
+   * credential it always had.
+   */
+  credentials?: ProviderCredential[];
   /** OpenAI Chat Completions (default) or stateless Responses endpoint. */
   wire?: "chat" | "responses";
   /** Catalog preset used to populate this provider, if any. */
@@ -789,6 +801,7 @@ export function validate(c: Config): string[] {
             }
           }
           if (cred.label !== undefined && typeof cred.label !== "string") errors.push(`provider ${name}: credential ${i} label must be a string`);
+          if ((entry as { paused?: unknown }).paused !== undefined && typeof (entry as { paused?: unknown }).paused !== "boolean") errors.push(`provider ${name}: credential ${i} paused must be true or false`);
         });
       }
     }

@@ -132,10 +132,120 @@ body {
 .nav-btn.active { background: var(--nav-selected); font-weight: 600; }
 .nav-icon { width: 18px; height: 18px; flex: 0 0 auto; color: var(--accent); }
 .nav-btn span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.sidebar-footer { margin-top: auto; padding: 0 2px; }
+.sidebar-footer { padding: 0 2px; }
 /* A label too long for the phone tab bar carries a short form for it. */
 .nav-btn .nav-short { display: none; }
 .sidebar-footer select { width: 100%; }
+
+/* ---- Usage panel (sidebar bottom, or the top of Status on a phone) --------------------- */
+
+/* One panel, moved between two slots by placeUsagePanel(): the sidebar keeps it above the language
+   menu, a phone puts it at the top of the Status page. Pushed to the bottom, and scrolling on its
+   own once there are more cards than fit: a short window must not push the language menu off the
+   bottom or overlap the navigation above it. */
+.sidebar-slot { margin-top: auto; padding-top: 14px; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+.sidebar-slot:empty { display: none; }
+.nav-list, .sidebar-footer { flex: 0 0 auto; }
+.usage-slot-phone:empty { display: none; }
+.usage-slot-phone { margin-bottom: 22px; }
+
+.usage-panel { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.usage-head {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 2px 4px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--label-2);
+  font: inherit;
+  font-size: var(--fs-cap);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-align: left;
+  cursor: pointer;
+}
+.usage-head:hover { color: var(--label); }
+.usage-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.usage-chevron { width: 10px; height: 6px; flex: 0 0 auto; opacity: 0.7; transition: transform 0.15s ease; }
+.usage-panel.collapsed .usage-chevron { transform: rotate(-90deg); }
+.usage-panel.collapsed .usage-body { display: none; }
+.usage-body { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+/* Two tiles to a row, one grid for every provider: six plans still fit the sidebar's height.
+   Tiles start at the top of their row, so a one-account reading beside an opened multi-account
+   tile is only as tall as its own figures instead of stretching to match the neighbour. */
+.usage-cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 6px; min-width: 0; }
+.usage-empty { margin: 0; padding: 2px 4px 4px; color: var(--label-3); font-size: var(--fs-cap); line-height: 1.4; }
+
+/* A tile is a small reading, not a control: every line is label, percent and time left at a glance.
+   Nothing in it may wrap — a tile that grows a line pushes the two beside it out of line. */
+.usage-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  padding: 6px 7px 7px;
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--group) 72%, transparent);
+  box-shadow: 0 0 0 1px var(--group-edge);
+  color: var(--label-2);
+  /* Every figure in the tile — label, percent, time — is set from here, so one row never reads
+     louder than the next and the three columns keep the same weight on both layouts. 11px is the
+     smallest size the figures stay readable at in the sidebar; the name sits a step above them. */
+  font-size: 11px;
+  white-space: nowrap;
+}
+/* A provider with several accounts opens them with a tap; a single-account tile is just a reading.
+   `font: inherit` here would hand the button the page's body size and blow the figures up, so only
+   the family and line height are inherited and the tile keeps its own size. */
+.usage-tile.expandable { appearance: none; border: 0; font-family: inherit; line-height: inherit; color: inherit; text-align: left; cursor: pointer; }
+.usage-tile.expandable:hover { background: color-mix(in srgb, var(--group) 92%, transparent); }
+.usage-tile.expandable.open { box-shadow: 0 0 0 1px var(--accent); }
+/* The mark stays out of the name's way: two characters in a small square, so a longer provider
+   name ("OpenRouter") still fits beside it. Nothing in a tile is ellipsised; the full name stays
+   on the tile's title. */
+.usage-tile-head { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.usage-tile-mark {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 4px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0;
+}
+.usage-tile-name {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  color: var(--label);
+  font-size: 12px;
+  font-weight: 600;
+}
+/* One grid for every row in the tile, so the three columns share their widths: the label column is
+   fixed (long labels like "Balance" widen it), the percent column is at least as wide as "100%" and
+   the time column is as wide as "30d 23h" — both right-aligned, so every percent and every time in
+   the tile ends on the same edge and nothing is ever cut off. The figures are 11px, so the columns
+   sit flush (no gap) rather than shrink: at 9px a 3px gap fit, at 11px it is what a wide percent
+   like "100%" would have to take out of the time column. Phone tiles are wider and add their own gap. */
+.usage-tile-figures { display: grid; grid-template-columns: minmax(2em, max-content) max-content minmax(max-content, 1fr); align-items: baseline; column-gap: 0; row-gap: 1px; min-width: 0; font-variant-numeric: tabular-nums; }
+.usage-tile-row { display: contents; }
+.usage-tile-account { grid-column: 1 / -1; margin-top: 2px; min-width: 0; color: var(--label-2); font-weight: 600; overflow: hidden; white-space: nowrap; }
+.usage-tile-window { min-width: 0; overflow: hidden; color: var(--label-3); font-weight: 600; letter-spacing: 0.02em; }
+.usage-tile-percent { min-width: 0; text-align: right; color: var(--label); font-weight: 600; }
+.usage-tile-percent.high { color: var(--warn); }
+.usage-tile-percent.full { color: var(--bad); }
+/* Time left is the quietest of the three: it is read after the percent, not instead of it. */
+.usage-tile-reset { min-width: 0; text-align: right; color: var(--label-3); font-weight: 500; }
 
 main { min-width: 0; padding: 36px 40px 72px; }
 
@@ -947,6 +1057,19 @@ a.cell { color: inherit; text-decoration: none; }
   .nav-btn .nav-icon { width: 22px; height: 22px; color: inherit; }
   .nav-btn span { white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow-wrap: break-word; word-break: keep-all; }
   .sidebar-footer { display: none; }
+  /* The usage panel is not part of the tab bar; placeUsagePanel() has moved it into Status. */
+  .sidebar-slot { display: none; }
+
+  /* On a phone the panel leads the Status page, so its tiles read at a thumb's distance. Still two
+     to a row: the same shape as the sidebar, only larger. */
+  .usage-slot-phone { margin: 0 0 24px; }
+  .usage-panel.in-phone-slot { gap: 8px; }
+  .usage-panel.in-phone-slot .usage-head { padding: 0 2px; font-size: var(--fs-foot); letter-spacing: 0; color: var(--label); }
+  .usage-panel.in-phone-slot .usage-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .usage-panel.in-phone-slot .usage-tile { padding: 8px 9px 9px; font-size: var(--fs-cap); }
+  .usage-panel.in-phone-slot .usage-tile-mark { width: 18px; height: 18px; font-size: 9px; }
+  .usage-panel.in-phone-slot .usage-tile-figures { column-gap: 4px; }
+  .usage-panel.in-phone-slot .usage-chevron { width: 12px; height: 7px; }
   .nav-btn .nav-long { display: none; }
   .nav-btn .nav-short { display: -webkit-box; }
   .narrow-only { display: block; }

@@ -1207,6 +1207,64 @@ what we do not have yet — so that adding a provider does not start with readin
   insufficient-credit response means the key is accepted but the account has no
   credit. Preset endpoint and capability claims cite the vendor's official docs in
   `packages/router/src/presets.ts`.
+- **Credential pools per key (2026-10-21).** A provider may declare `credentials`
+  (`{id, headers, label?, paused?}`) beside its single `headers`, and requests fail
+  over between them in the same turn, before the first byte reaches the client —
+  after that a retry would duplicate output the client already has. A conversation
+  stays on its key while that key is healthy (`pool.ts` stickiness), because moving
+  it moves the vendor's prompt cache with it. A provider with no `credentials` keeps
+  exactly the one credential it always had, under a fixed id, so health survives a
+  config edit that does not touch it.
+  - Provider `headers` are merged **under** the key's own `headers`, minus the auth
+    ones (`authorization`, `x-api-key`): an org header set once on the provider is
+    sent with every key, and the auth header is only ever the key's. Sending the
+    provider's copy over it would put one key's credential on another key's request.
+  - A key is cooled by a 429 for the reset the vendor states — `retry-after`, else
+    the reset field in the body, else one usage read, else 60 s — and never further
+    than `MAX_COOLDOWN_MS` (6 h) when the wait came from a refusal: a refusal is
+    about this key now, and a "reset" days out that it claims is more likely a
+    misread field. A **usage window**'s own reset is a real date and is not clamped,
+    so a weekly window at 100 % parks its key until that window actually resets.
+  - OpenCode Go keys are also parked **pre-emptively** from the cached `/usage`
+    snapshot: a key whose window is already at 100 % is not tried at all. This is
+    what the user asked for — the plan's Extra-usage pay-as-you-go is never reached
+    while another key is free — and it means the vendor is not first asked to refuse.
+    The snapshot is only ever read from the cache on the request path (never
+    fetched); `/api/opencode-accounts` is where a read is awaited, and it parks from
+    the answer it just read rather than starting a second lookup.
+  - `POST /v1/messages/count_tokens` answers locally, so it neither charges the key
+    nor cools one: a local estimate must not take a key out of rotation.
+  - When **every** key of a provider is paused, the router answers 503 locally
+    ("every key of <provider> is paused", `overloaded_error`) instead of sending the
+    request on the first key: the operator said stop, so the vendor must not be
+    charged for a key that was deliberately taken out.
+  - `/api/opencode-accounts` reports one state per key — `in-use` (what a new
+    conversation would get), `standby`, `cooling`, `paused`, `quarantined`, and
+    `unknown` for a key whose usage has never been read. A failed read keeps the last
+    good snapshot, so a key is never presented as healthy because the read failed.
+
+### 4c-i. Credit balances (2026-10-21)
+
+Some providers sell prepaid credit rather than counting windows, and state what is
+left. `/api/limits` reports those as `type: "credit"` with one account row
+`{account: 0, windows: [], at, credit: {remaining_usd, days_remaining?, low}}`;
+`low` is the tile's warning colour, under $5 left or under three days of it. The
+reader (`providers/credit-balance.ts`) is cached five minutes per provider, keeps
+the last good value when a read fails, logs only the status, and never runs on the
+request path.
+
+- **sail** (`api.sailresearch.com`): `GET /v2/usage/summary?range=30d` with the
+  provider's own auth header. `balance` is in **fractional USD cents**, so 73795 is
+  $737.95; a body that says `balance_unavailable` is skipped rather than read as
+  zero. `days_remaining` is passed through as given.
+  (https://docs.sailresearch.com/usage-endpoints.md)
+- **OpenRouter** (`openrouter.ai`): `GET /api/v1/credits`, remaining =
+  `total_credits - total_usage`. Measured 2026-10-21: it answers 200 with an
+  inference key although the docs name a management key. When that read fails, it
+  falls back to `GET /api/v1/key`'s `limit_remaining`; `null` there means the key
+  has no limit, which says nothing about a balance.
+  (openrouter.ai/docs/api/api-reference/credits/get-remaining-credits.md,
+  openrouter.ai/docs/api/api-reference/limits.md)
 
 ### 4d. `google` providers (implemented 2026-10-01)
 

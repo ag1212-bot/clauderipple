@@ -142,6 +142,44 @@ test("the report says why a credential is idle and for how long", () => {
   assert.equal(b?.cooldownSeconds, undefined);
 });
 
+test("a paused credential is never picked, keeps its place, and reports as paused", () => {
+  const pool = new CredentialPool();
+  const all: Credential[] = [
+    { id: "a", headers: {}, paused: true },
+    { id: "b", headers: {} },
+  ];
+  assert.equal(pool.pick("p", all, "conv")?.id, "b", "a paused key is skipped even as the first one");
+  assert.equal(pool.pick("p", all)?.id, "b");
+  assert.equal(pool.hasUsable("p", [all[0]!]), false);
+  // When every key is paused there is nothing to pick, exactly as when every key is cooling.
+  assert.equal(pool.pick("p", [all[0]!]), null);
+  assert.deepEqual(pool.report("p", all).map((r) => r.state), ["paused", "ready"]);
+  // Paused outranks a cooldown in the report: the dashboard should offer "resume", not "clear cooldown".
+  pool.penalise("p", "a", 429, 60_000);
+  assert.equal(pool.report("p", all)[0]?.state, "paused");
+  // Un-pausing puts it straight back at the front, because the list order is the priority. (A new
+  // conversation, not the one already stuck to b: stickiness keeps that one where it is. Its own
+  // cooldown from above is cleared first, as the dashboard's "resume" does.)
+  pool.clear("p", "a");
+  assert.equal(pool.pick("p", [{ ...all[0]!, paused: false }, all[1]!], "new-conv")?.id, "a");
+});
+
+test("cooling until a stated reset leaves a longer cooldown alone, and a shorter one is not shortened", () => {
+  const c = clock();
+  const pool = new CredentialPool({ now: c.now });
+  const all = creds("a", "b");
+  // A usage window that resets in an hour parks the key until then.
+  pool.coolUntil("p", "a", c.now() + 3_600_000);
+  assert.equal(pool.report("p", all)[0]?.cooldownSeconds, 3_600);
+  assert.equal(pool.pick("p", all)?.id, "b");
+  // A reset five minutes away must not cut that hour short.
+  pool.coolUntil("p", "a", c.now() + 300_000);
+  assert.equal(pool.report("p", all)[0]?.cooldownSeconds, 3_600);
+  // The key is usable again once the hour passes, without anything having to clear it.
+  c.advance(3_600_001);
+  assert.equal(pool.pick("p", all)?.id, "a");
+});
+
 test("an operator can un-park a credential without restarting the router", () => {
   const pool = new CredentialPool();
   const all = creds("a", "b");

@@ -294,6 +294,10 @@ test("validate refuses a credential pool with duplicate ids or non-string header
   assert.ok(cfg([{ headers: {} }])[0]?.includes("non-empty id"));
   assert.ok(cfg([{ id: "a", headers: { key: 5 } }])[0]?.includes("string record"));
   assert.ok(cfg([{ id: "a", headers: {}, label: 7 }])[0]?.includes("label must be a string"));
+  // A paused key stays in the list (and so keeps its priority), so the flag has to be a boolean.
+  assert.deepEqual(cfg([{ id: "a", headers: {}, paused: true }]), []);
+  assert.deepEqual(cfg([{ id: "a", headers: {}, paused: false }]), []);
+  assert.ok(cfg([{ id: "a", headers: {}, paused: "yes" }])[0]?.includes("paused must be true or false"));
 });
 
 test("validate accepts a grok provider and refuses a model that would leave its session headers behind", () => {

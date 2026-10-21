@@ -233,6 +233,9 @@ function showView(name) {
   if (name === "logs") queueMicrotask(() => void refreshRequests());
   // Read again on every visit: the bar's ⚙ panel saves the same settings.
   if (name === "mod") queueMicrotask(() => void loadMod());
+  // Quotas move while a page is open, so arriving at a page is a good moment to look again.
+  // Deferred: the first showView runs before the usage panel's state is declared.
+  queueMicrotask(() => void refreshUsage());
 }
 for (const button of $all(".nav-btn")) button.addEventListener("click", () => showView(button.dataset.view));
 window.addEventListener("hashchange", () => showView((location.hash || "#health").slice(1)));
@@ -353,6 +356,360 @@ async function startUpdate() {
   }
   renderVersionRow();
 }
+
+// ---- Usage panel ---------------------------------------------------------------------
+//
+// What is left of each subscription plan, from `GET /api/limits`. It is the same body the status
+// bar's row reads: one entry per provider, and one account inside it per plan or per key. Only
+// subscription providers appear — an API-key provider has a balance, not a window.
+//
+// One small tile per account, two to a row: the provider's mark, its name, and each window as a
+// compact figure ("5H 12%"). The reset times are a tap away — a phone has no hover at all, so a
+// tap (or a click) is the only way they are allowed to exist.
+//
+// A desktop window keeps the panel at the bottom left of the sidebar, where it is visible from
+// every page. A phone has no sidebar left (it becomes a tab bar), so the same panel is moved to
+// the top of the Status page instead of being duplicated: one element, one place.
+
+const USAGE_REFRESH_MS = 60_000;
+const USAGE_OPEN_KEY = "clauderipple_usage_open";
+/** The width at which style.css turns the sidebar into a tab bar (see `@media (max-width: 720px)`). */
+const USAGE_NARROW = "(max-width: 720px)";
+
+let usageLimits = null;
+let usageGeneration = 0;
+let usageError = "";
+let usageOpen = true;
+(function restoreUsageOpen() {
+  try {
+    const saved = localStorage.getItem(USAGE_OPEN_KEY);
+    if (saved === "0") usageOpen = false;
+    if (saved === "1") usageOpen = true;
+  } catch { /* storage unavailable: stay open */ }
+})();
+
+/**
+ * Which window a `used_percent` belongs to: `five_hour`, `seven_day`, `month`, `label` (the
+ * vendor's own word), or `hours` with the length it is called by. A tile and a key card name the
+ * same window, so both read this one classification and only pick their own words for it below.
+ */
+function usageWindowKind(window) {
+  const minutes = typeof window.window_minutes === "number" ? window.window_minutes : 0;
+  if (window.kind === "five_hour" || minutes === 5 * 60) return { kind: "five_hour" };
+  if (window.kind === "seven_day" || minutes === 7 * 24 * 60) return { kind: "seven_day" };
+  // About a month: OpenCode Go's third window.
+  if (minutes >= 28 * 24 * 60) return { kind: "month" };
+  if (window.label) return { kind: "label", label: String(window.label) };
+  if (minutes > 0) return { kind: "hours", hours: Math.max(1, Math.round(minutes / 60)) };
+  return { kind: "other" };
+}
+
+/** The tile's short name for that window: 5H, 7D, M. */
+function usageWindowName(window) {
+  const kind = usageWindowKind(window);
+  if (kind.kind === "five_hour") return t("usage.window5h");
+  if (kind.kind === "seven_day") return t("usage.window7d");
+  if (kind.kind === "month") return t("usage.windowMonth");
+  if (kind.kind === "label") return kind.label;
+  if (kind.kind === "hours") return t("usage.windowHours", { hours: kind.hours });
+  return t("usage.windowOther");
+}
+
+/** The long name a key card uses for the same window: 5시간, 주간, 월간. */
+function usageWindowLongName(window) {
+  const kind = usageWindowKind(window);
+  if (kind.kind === "five_hour") return t("quota.window5h");
+  if (kind.kind === "seven_day") return t("quota.windowWeek");
+  if (kind.kind === "month") return t("keys.windowMonth");
+  if (kind.kind === "label") return kind.label;
+  if (kind.kind === "hours") return t("quota.windowHours", { hours: kind.hours });
+  return t("usage.windowOther");
+}
+
+/**
+ * How long until the window resets, in the shortest reading that stays honest: "59m", "3h 35m",
+ * "2d 7h". Two units at most, so the line beside the percent never grows.
+ */
+function usageResetText(window) {
+  if (typeof window.reset_at !== "number") return "";
+  const left = Math.round(window.reset_at * 1000 - Date.now());
+  if (left <= 0) return t("usage.resetting");
+  const minutes = Math.floor(left / 60_000);
+  if (minutes >= 24 * 60) return t("usage.daysHours", { d: Math.floor(minutes / (24 * 60)), h: Math.floor((minutes % (24 * 60)) / 60) });
+  if (minutes >= 60) return t("usage.hoursMinutes", { h: Math.floor(minutes / 60), m: minutes % 60 });
+  return t("usage.minutes", { m: Math.max(1, minutes) });
+}
+
+/** Whole days until an epoch-seconds moment: "12d". The M row reads only this much. */
+function usageDaysText(epoch) {
+  if (typeof epoch !== "number" || !Number.isFinite(epoch)) return "";
+  const left = Math.round(epoch * 1000 - Date.now());
+  if (left <= 0) return t("usage.daysShort", { days: 0 });
+  return t("usage.daysShort", { days: Math.max(1, Math.ceil(left / 86_400_000)) });
+}
+
+/** Percent as it is written on a tile; one decimal only where the whole number would hide a rise. */
+function usagePercentText(percent) {
+  const value = Math.max(0, Math.min(100, Number(percent) || 0));
+  return value >= 10 || Number.isInteger(value) ? `${Math.round(value)}%` : `${value.toFixed(1)}%`;
+}
+
+/** How a percent is coloured: quiet up to 80, a warning to 99, a full window red. */
+function usageSeverity(percent) {
+  const value = Number(percent) || 0;
+  return value >= 100 ? " full" : value >= 80 ? " high" : "";
+}
+
+/** "GPT 1" — the account's own name where the router gives one, else its provider and position. */
+function usageAccountName(provider, account, index, count) {
+  const own = account.label || (account.title && String(account.title));
+  // A named account is called by its name; the position is only how an unnamed one is told apart.
+  if (own) return own;
+  return count <= 1 ? usageBaseName(provider) : `${usageBaseName(provider)} ${index + 1}`;
+}
+
+/** The provider's short word: "Claude", "GPT", "Go", "Gemini", "Grok". */
+function usageBaseName(provider) {
+  if (provider.type === "opencode-go") return t("usage.goName");
+  return provider.title || provider.provider;
+}
+
+/** The tile's square mark: the short name's first letters, like an app icon ("Cl", "GP", "Go"). */
+function usageMarkText(provider) {
+  const letters = String(usageBaseName(provider) || "").replace(/[^A-Za-z0-9]/g, "");
+  return letters.slice(0, 2) || "•";
+}
+
+/**
+ * One line of the tile: "5H 42% 59m" — label, percent and time left, always shown. The three are
+ * columns (see style.css), so the numbers line up down a tile and between accounts.
+ */
+function usageRow(label, percent, percentClass, time, kind) {
+  return el("span", { class: "usage-tile-row" }, [
+    el("span", { class: "usage-tile-window", text: label }),
+    el("span", { class: `usage-tile-percent${percentClass || ""}`, text: percent }),
+    el("span", { class: "usage-tile-reset", ...(kind ? { "data-window": kind } : {}), text: time }),
+  ]);
+}
+
+/**
+ * A quota window as its line. The M row counts whole days — the renewal date when the account has
+ * one, else the window's own reset — and the shorter windows keep the h/m reading.
+ */
+function usageFigure(window, account) {
+  const kind = usageWindowKind(window).kind;
+  const percent = usagePercentText(window.used_percent);
+  const time = kind === "month"
+    ? usageDaysText(typeof account.renews_at === "number" ? account.renews_at : window.reset_at)
+    : usageResetText(window);
+  return usageRow(usageWindowName(window), percent, usageSeverity(window.used_percent), time, kind);
+}
+
+/** A credit balance as the tile writes it: "$738", "$73.9", "$3.95". Cents only where they matter. */
+function usageUsd(remaining) {
+  const value = Number(remaining) || 0;
+  if (value >= 100) return `$${Math.round(value)}`;
+  if (value >= 10) return `$${value.toFixed(1)}`;
+  return `$${value.toFixed(2)}`;
+}
+
+/** Whole days left as the credit tile says them: "12d", the same reading the M row uses. */
+function usageCreditDays(days) {
+  return t("usage.daysShort", { days: Math.max(0, Math.floor(Number(days))) });
+}
+
+/**
+ * The head of every tile: a small mark, then the name. A tile is narrow, so the name is allowed to
+ * shorten itself but never to wrap; the whole name stays reachable as the button's title.
+ */
+function usageTileHead(name, provider) {
+  return el("span", { class: "usage-tile-head" }, [
+    el("span", { class: "usage-tile-mark", "aria-hidden": "true", text: usageMarkText(provider) }),
+    el("span", { class: "usage-tile-name", text: name }),
+  ]);
+}
+
+/** The account's quota rows, and the M row when the vendor renews a subscription instead of metering it. */
+function usageAccountFigures(account, windows) {
+  const monthWindow = windows.find((window) => usageWindowKind(window).kind === "month");
+  const rows = windows.map((window) => usageFigure(window, account));
+  if (!monthWindow && typeof account.renews_at === "number") {
+    // GPT and Claude have no monthly quota: the M row is the renewal, with no percent to show.
+    rows.push(usageRow(t("usage.windowMonth"), "—", "", usageDaysText(account.renews_at), "month"));
+  }
+  return rows;
+}
+
+/** A credit balance as one line: "잔액 $738 12d", the days column left empty when they are unknown. */
+function usageCreditFigure(credit) {
+  const days = typeof credit.days_remaining === "number" && Number.isFinite(credit.days_remaining)
+    ? usageCreditDays(credit.days_remaining)
+    : "";
+  return usageRow(t("usage.creditBalance"), usageUsd(credit.remaining_usd), credit.low ? " high" : "", days, "credit");
+}
+
+function usageAccountRows(account) {
+  const windows = Array.isArray(account.windows) ? account.windows.filter((window) => window && typeof window.used_percent === "number") : [];
+  if (windows.length) return usageAccountFigures(account, windows);
+  if (account.credit && typeof account.credit.remaining_usd === "number") return [usageCreditFigure(account.credit)];
+  // An account with neither windows nor a balance still counts toward the (n/m) on the tile.
+  return [];
+}
+
+/** Which account a provider's tile is about when it has several: the one in use, else the first. */
+const usageInUse = new Map();
+const usageExpanded = new Set();
+
+/** Accounts whose rows are worth drawing: a credit tile has one balance, not an account list. */
+function usageExpandable(provider, accounts) {
+  return accounts.length > 1 && provider.type !== "credit";
+}
+
+function usageTile(provider, accounts) {
+  const inUse = usageInUse.has(provider.provider) ? usageInUse.get(provider.provider) : 0;
+  const index = inUse >= 0 && inUse < accounts.length ? inUse : 0;
+  const account = accounts[index];
+  const base = usageBaseName(provider);
+  const name = usageExpandable(provider, accounts) ? `${base} (${index + 1}/${accounts.length})` : base;
+  const open = usageExpanded.has(provider.provider);
+  const rows = [];
+  for (const row of usageAccountRows(account)) rows.push(row);
+  if (open) {
+    // The accounts the tile does not speak for, each under its own name so the figure has an owner.
+    accounts.forEach((other, at) => {
+      if (at === index) return;
+      const otherRows = usageAccountRows(other);
+      if (!otherRows.length) return;
+      rows.push(el("span", { class: "usage-tile-account", text: usageAccountName(provider, other, at, accounts.length) }));
+      for (const row of otherRows) rows.push(row);
+    });
+  }
+  const body = el("span", { class: "usage-tile-figures" }, rows);
+  const kindClass = provider.type === "credit" ? " credit" : "";
+  if (!usageExpandable(provider, accounts)) {
+    return el("span", { class: `usage-tile${kindClass}`, title: name }, [usageTileHead(name, provider), body]);
+  }
+  const tile = el("button", { class: `usage-tile expandable${kindClass}${open ? " open" : ""}`, type: "button", title: name, "aria-expanded": String(open), "aria-label": name }, [
+    usageTileHead(name, provider),
+    body,
+  ]);
+  tile.addEventListener("click", () => {
+    if (usageExpanded.has(provider.provider)) usageExpanded.delete(provider.provider); else usageExpanded.add(provider.provider);
+    renderUsage();
+  });
+  return tile;
+}
+
+/** One tile per provider, two to a row; several accounts share the tile and open on a tap. */
+function usageTiles(providers) {
+  const tiles = [];
+  for (const provider of providers) {
+    const accounts = Array.isArray(provider.accounts) ? provider.accounts : [];
+    if (!accounts.length) continue;
+    tiles.push(usageTile(provider, accounts));
+  }
+  return tiles;
+}
+
+/**
+ * Ask the router which account each multi-account provider is using. `/api/limits` numbers accounts
+ * in the same order as these lists, but only counts the ones it has quota for, so the answer is an
+ * index to look up, not a promise; a miss falls back to the first account.
+ */
+async function resolveUsageInUse(providers) {
+  let changed = false;
+  for (const provider of providers) {
+    const accounts = Array.isArray(provider.accounts) ? provider.accounts : [];
+    if (!usageExpandable(provider, accounts)) continue;
+    const name = provider.provider;
+    try {
+      let at = -1;
+      if (provider.type === "chatgpt") {
+        const body = await api(`/api/chatgpt-accounts?provider=${encodeURIComponent(name)}`);
+        const list = (Array.isArray(body.accounts) ? body.accounts : []).filter((a) => a.state !== "paused" && a.state !== "needs-login");
+        at = list.findIndex((a) => a.active === true);
+      } else if (provider.type === "opencode-go") {
+        const body = await api(`/api/opencode-accounts?provider=${encodeURIComponent(name)}`);
+        const list = Array.isArray(body.accounts) ? body.accounts : [];
+        at = list.findIndex((a) => a.state === "in-use");
+      }
+      // That list's position is the account number the router gives a limits row, and a row for a
+      // key with no readable windows is left out of `/api/limits`, so match by number.
+      const limitIndex = at >= 0 ? accounts.findIndex((a) => a.account === at) : -1;
+      const next = limitIndex >= 0 ? limitIndex : 0;
+      if (usageInUse.get(name) !== next) { usageInUse.set(name, next); changed = true; }
+    } catch { /* the tile stays on its fallback account */ }
+  }
+  if (changed) renderUsage();
+}
+
+function renderUsage() {
+  const box = $("#usage-cards");
+  const empty = $("#usage-empty");
+  if (!box || !empty) return;
+  const providers = (usageLimits && Array.isArray(usageLimits.providers)) ? usageLimits.providers : [];
+  const tiles = usageTiles(providers);
+  box.replaceChildren(...tiles);
+  box.hidden = tiles.length === 0;
+  empty.hidden = tiles.length !== 0;
+  // An unreachable router is a quiet note, not a tile: the panel keeps its last good numbers.
+  empty.textContent = tiles.length === 0 ? (usageError || t("usage.empty")) : "";
+}
+
+async function refreshUsage() {
+  const generation = ++usageGeneration;
+  try {
+    const body = await api("/api/limits");
+    if (generation !== usageGeneration) return;
+    usageLimits = body;
+    usageError = "";
+  } catch (error) {
+    if (generation !== usageGeneration) return;
+    // Keep the last good numbers; say why only when there are none to keep. An HTTP answer is its
+    // own reason (a 404 from an older router, a 500), so it is named rather than swallowed.
+    usageError = error.status ? t("usage.unreachableStatus", { status: error.status }) : t("usage.unreachable");
+  }
+  renderUsage();
+  if (generation === usageGeneration && usageLimits) void resolveUsageInUse(usageLimits.providers || []);
+}
+
+/** Open or closed, remembered: someone who folded the panel away does not want it back each visit. */
+function setUsageOpen(open) {
+  usageOpen = open;
+  const panel = $("#usage-panel");
+  const toggle = $("#usage-toggle");
+  if (panel) panel.classList.toggle("collapsed", !open);
+  if (toggle) toggle.setAttribute("aria-expanded", String(open));
+  try { localStorage.setItem(USAGE_OPEN_KEY, open ? "1" : "0"); } catch { /* unavailable */ }
+}
+
+/** A phone moves the one panel into the Status page; a wider window puts it back in the sidebar. */
+function placeUsagePanel() {
+  const panel = $("#usage-panel");
+  const slot = $("#usage-slot");
+  const phone = $("#usage-slot-phone");
+  if (!panel || !slot || !phone) return;
+  const narrow = window.matchMedia(USAGE_NARROW).matches;
+  const target = narrow ? phone : slot;
+  if (panel.parentElement !== target) target.appendChild(panel);
+  panel.classList.toggle("in-phone-slot", narrow);
+}
+
+$("#usage-toggle") && $("#usage-toggle").addEventListener("click", () => setUsageOpen(!usageOpen));
+(function setupUsagePanel() {
+  placeUsagePanel();
+  setUsageOpen(usageOpen);
+  window.matchMedia(USAGE_NARROW).addEventListener("change", () => { placeUsagePanel(); });
+  void refreshUsage();
+  setInterval(() => {
+    // Nothing on screen to update while a page is hidden; the next visit refreshes anyway.
+    if (document.visibilityState === "hidden") return;
+    void refreshUsage();
+  }, USAGE_REFRESH_MS);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") void refreshUsage();
+  });
+})();
 
 // ---- Inside the app: the connection card, and pages while the router is down -------------
 // The app can do what this page cannot once the router is down: ask the CLI what is wrong
@@ -687,6 +1044,7 @@ function credentialLine(name) {
   if (!pool.length) return null;
   const parts = pool.map((c) => {
     const who = c.label || c.id;
+    if (c.state === "paused") return `${who}: ${t("providers.chatgptPaused")}`;
     if (c.state === "quarantined") return `${who}: ${t("pool.quarantined")}`;
     if (c.state === "cooling") return `${who}: ${t("pool.cooling", { seconds: c.cooldownSeconds ?? 0 })}`;
     return `${who}: ${t("pool.ready")}`;
@@ -1976,7 +2334,7 @@ async function removeProvider(name, provider) {
 
 function providerTabs(name, provider) {
   const tabs = [{ id: "overview", label: t("providers.overview") }];
-  if ((provider.type === "anthropic" && provider.auth === "claude-code") || provider.type === "chatgpt" || (provider.type === "google" && provider.auth === "antigravity")) tabs.push({ id: "accounts", label: t("providers.accounts") });
+  if ((provider.type === "anthropic" && provider.auth === "claude-code") || provider.type === "chatgpt" || (provider.type === "google" && provider.auth === "antigravity") || isOpencodeGoProvider(provider)) tabs.push({ id: "accounts", label: t("providers.accounts") });
   tabs.push({ id: "models", label: t("providers.modelsTab") });
   return el("div", { class: "provider-tabs", role: "tablist" }, tabs.map((tab) => {
     const button = el("button", { class: providerDetailTab === tab.id ? "active" : "", type: "button", role: "tab", "aria-selected": String(providerDetailTab === tab.id), text: tab.label });
@@ -2415,6 +2773,377 @@ function chatgptAccountsPanel(name) {
   return panel;
 }
 
+/** Whether this provider is an OpenCode Go subscription, whose keys form a pool (router: isOpenCodeGo). */
+function isOpencodeGoProvider(provider) {
+  if (!provider || provider.type !== "openai-compatible") return false;
+  if (provider.preset === "opencode-go") return true;
+  try {
+    const url = new URL(provider.url);
+    return url.hostname === "opencode.ai" && /^\/zen\/go\/v1(?:\/|$)/.test(url.pathname);
+  } catch { return false; }
+}
+
+/**
+ * A provider's keys as the pool reads them. `credentials` is the saved shape; a provider that has
+ * only the old `headers.authorization` shows that one as key 1 and is migrated to `credentials` on
+ * the first save here. Only ids, labels and header *names* leave this function — never a value.
+ */
+function keyRowsOf(provider) {
+  const stored = Array.isArray(provider && provider.credentials) ? provider.credentials : [];
+  if (stored.length) {
+    return stored
+      .filter((entry) => entry && typeof entry.id === "string" && entry.id)
+      .map((entry, index) => ({ id: entry.id, label: entry.label || t("keys.defaultLabel", { number: index + 1 }), legacy: false }));
+  }
+  const headers = (provider && provider.headers) || {};
+  const hasKey = Object.entries(headers).some(([name, value]) => /^(authorization|x-api-key)$/i.test(name) && typeof value === "string" && value.trim());
+  return hasKey ? [{ id: "legacy", label: t("keys.legacyLabel"), legacy: true }] : [];
+}
+
+/** The bearer value a key field was given: whatever was pasted, with stray spaces or a prefix taken off. */
+function keyValueOf(text) {
+  return String(text || "").trim().replace(/^bearer\s+/i, "").replace(/\s+/g, "");
+}
+
+/** A fresh id for a key: `key-1`, `key-2`, … skipping ids already used. */
+function nextKeyId(rows) {
+  const used = new Set(rows.map((row) => row.id));
+  let number = 1;
+  while (used.has(`key-${number}`)) number += 1;
+  return `key-${number}`;
+}
+
+/**
+ * Save a new list of keys onto the provider, without ever handling a stored key's value.
+ *
+ * The headers of the keys that already exist are taken from the config the router just sent, matched
+ * by id, so a rename or a reorder cannot blank them. Only a newly typed key carries a value. Every
+ * other field a key carries (`paused`, and whatever the router adds later) rides along untouched.
+ * The whole save starts from `latestConfig()` like every other screen, so a concurrent edit survives.
+ */
+async function saveProviderKeys(name, change) {
+  const next = clone(await latestConfig());
+  const saved = next.providers && next.providers[name];
+  if (!saved) throw new Error(t("providers.noSelection"));
+  const stored = Array.isArray(saved.credentials) ? saved.credentials.filter((entry) => entry && typeof entry.id === "string") : [];
+  if (!stored.length) {
+    // The provider still holds one key in `headers`; it becomes key 1 on the first save here.
+    const headers = saved.headers || {};
+    const card = ["authorization", "x-api-key"].find((header) => typeof headers[header] === "string" && headers[header].trim());
+    if (card) {
+      stored.push({ id: "key-1", label: t("keys.legacyLabel"), headers: { ...headers } });
+      const kept = Object.fromEntries(Object.entries(headers).filter(([header]) => !/^(authorization|x-api-key)$/i.test(header)));
+      if (Object.keys(kept).length) saved.headers = kept;
+      else delete saved.headers;
+    }
+  }
+  const byId = new Map(stored.map((entry) => [entry.id, entry]));
+  // A credential is a complete header set (the router sends it instead of the provider's headers),
+  // so a new key takes the provider's other headers with it.
+  const sharedHeaders = Object.fromEntries(Object.entries(saved.headers || {}).filter(([header]) => !/^(authorization|x-api-key)$/i.test(header)));
+  const credentials = change(byId, stored, sharedHeaders).map((entry) => ({
+    ...entry,
+    id: entry.id,
+    ...(entry.label ? { label: entry.label } : {}),
+    headers: entry.headers,
+  }));
+  if (credentials.length) saved.credentials = credentials;
+  else delete saved.credentials;
+  await configRequest(next);
+  currentConfig = next;
+  providersLoaded = false;
+  renderProviderDetail();
+}
+
+/** Add a key: a label and the key itself, in the sheet every other add uses. */
+function openAddKeyDialog(name) {
+  const labelInput = el("input", { type: "text", maxlength: "60", autocomplete: "off", placeholder: t("keys.labelPlaceholder") });
+  const keyInput = el("input", { type: "password", autocomplete: "off", spellcheck: "false", placeholder: t("keys.keyPlaceholder") });
+  const showKey = el("button", { class: "eye-button", type: "button", text: t("common.show") });
+  showKey.addEventListener("click", () => {
+    const show = keyInput.type === "password";
+    keyInput.type = show ? "text" : "password";
+    showKey.textContent = show ? t("common.hide") : t("common.show");
+  });
+  const problem = el("small", { class: "bad-text", role: "alert", hidden: "" });
+  const save = el("button", { class: "btn", type: "button", "data-default-action": "", text: t("keys.add") });
+  const check = () => {
+    const key = keyValueOf(keyInput.value);
+    const issue = key && /\s/.test(keyInput.value.trim().replace(/^bearer\s+/i, "")) ? t("keys.spaces") : "";
+    problem.textContent = issue;
+    problem.hidden = !issue;
+    save.disabled = !key || Boolean(issue);
+  };
+  keyInput.addEventListener("input", check);
+  check();
+  save.addEventListener("click", async () => {
+    const key = keyValueOf(keyInput.value);
+    if (!key) return;
+    save.disabled = true;
+    const label = labelInput.value.trim();
+    try {
+      await saveProviderKeys(name, (byId, stored, sharedHeaders) => {
+        // The id is picked from what is actually stored, not from the rows on screen: a legacy key
+        // is shown as `legacy` but is migrated to `key-1` just before this runs, and reusing the
+        // on-screen ids made the new key collide with it.
+        const id = nextKeyId(stored);
+        const entry = { id, label: label || t("keys.defaultLabel", { number: stored.length + 1 }), headers: { ...sharedHeaders, authorization: `Bearer ${key}` } };
+        return [...stored, entry];
+      });
+      closeModal();
+      toast(t("keys.added"));
+    } catch (error) {
+      save.disabled = false;
+      toast(t("common.saveFailed"), true, error.message);
+    }
+  });
+  showModal(el("div", {}, [
+    el("h1", { id: "modal-title", text: t("keys.addTitle") }),
+    hint(t("keys.addHelp")),
+    el("label", { class: "form-field" }, [el("span", { text: t("keys.label") }), labelInput]),
+    el("div", { class: "form-field key-field" }, [
+      el("span", { text: t("keys.key") }),
+      el("div", { class: "key-control" }, [keyInput, showKey]),
+      problem,
+      el("small", { text: t("keys.keyHelp") }),
+    ]),
+    el("div", { class: "actions end" }, [el("button", { class: "btn secondary", type: "button", text: t("common.cancel"), onclick: closeModal }), save]),
+  ]));
+}
+
+/**
+ * Rename one key. The label is the only editable thing: the router never hands a saved key back.
+ * `apply` lets a caller save through its own endpoint (an OpenCode Go key's `PATCH`); without one
+ * the label goes through the config save, which is what a provider form's keys use.
+ */
+function openRenameKeyDialog(name, row, apply) {
+  const input = el("input", { type: "text", value: row.label, maxlength: "60", autocomplete: "off" });
+  const save = el("button", { class: "btn", type: "button", "data-default-action": "", text: t("common.save") });
+  const check = () => { save.disabled = !input.value.trim() || input.value.trim() === row.label; };
+  input.addEventListener("input", check);
+  check();
+  save.addEventListener("click", async () => {
+    const label = input.value.trim();
+    if (!label) return;
+    save.disabled = true;
+    try {
+      if (apply) await apply(label);
+      else await saveProviderKeys(name, (byId, stored) => stored.map((entry) => entry.id === row.id ? { ...entry, label } : entry));
+      closeModal();
+      toast(t("common.saved"));
+    } catch (error) {
+      save.disabled = false;
+      toast(t("common.saveFailed"), true, error.message);
+    }
+  });
+  input.addEventListener("keydown", (event) => { if (event.key === "Enter" && !save.disabled) save.click(); });
+  showModal(el("div", {}, [
+    el("h1", { id: "modal-title", text: t("keys.renameTitle") }),
+    el("label", { class: "form-field" }, [el("span", { text: t("keys.label") }), input, el("small", { text: t("keys.renameHelp") })]),
+    el("div", { class: "actions end" }, [el("button", { class: "btn secondary", type: "button", text: t("common.cancel"), onclick: closeModal }), save]),
+  ]));
+  setTimeout(() => input.focus(), 0);
+}
+
+function removeProviderKey(name, row, rows) {
+  if (!confirm(t("keys.removeConfirm", { name: row.label }))) return;
+  void saveProviderKeys(name, (byId, stored) => stored.filter((entry) => entry.id !== row.id))
+    .then(() => toast(t("keys.removed")))
+    .catch((error) => toast(t("common.saveFailed"), true, error.message));
+}
+
+/** Move a key one place up or down; the router tries the list in this order. */
+function moveProviderKey(name, row, rows, delta) {
+  const at = rows.findIndex((entry) => entry.id === row.id);
+  const to = at + delta;
+  if (at < 0 || to < 0 || to >= rows.length) return;
+  void saveProviderKeys(name, (byId, stored) => {
+    const ordered = [...stored];
+    const [moved] = ordered.splice(at, 1);
+    ordered.splice(to, 0, moved);
+    return ordered;
+  }).catch((error) => toast(t("common.saveFailed"), true, error.message));
+}
+
+/**
+ * OpenCode Go's keys. The same card list as the ChatGPT accounts tab: one card per key, in the order
+ * the router tries them, with the key's state, its usage and the same actions. A conversation keeps
+ * its own key while that key is healthy, so the order only matters when one is cooling.
+ *
+ * Every act on a saved key goes to the dedicated endpoint (`PATCH`/`DELETE /api/opencode-accounts/:id`)
+ * so the router writes the key's own field and no other card's header is touched. The config save
+ * (`PUT /api/config`) is kept for the two things only it can do: adding a key and reordering.
+ *
+ * A stored key is shown as "저장한 키를 쓰고 있습니다" and nothing more — the router keeps the value,
+ * and this screen never puts it back on the page.
+ */
+const OPENCODE_STATES = new Set(["in-use", "standby", "cooling", "paused", "quarantined"]);
+
+/** "5시간 33% · 주간 86% · 월간 55%" — the same line the ChatGPT cards use for a quota. */
+function opencodeQuotaText(windows) {
+  const list = Array.isArray(windows) ? windows : [];
+  return list.filter((window) => window && typeof window.used_percent === "number").map((window) =>
+    t("quota.line", { window: usageWindowLongName(window), percent: Math.round(window.used_percent) }).trim(),
+  ).join(" · ");
+}
+
+function opencodeStateBadge(account) {
+  const state = OPENCODE_STATES.has(account.state) ? account.state : null;
+  const cooldown = typeof account.cooldown_seconds === "number" ? account.cooldown_seconds : 0;
+  if (state === "paused") return el("span", { class: "badge", text: t("providers.chatgptPaused") });
+  if (state === "quarantined") return el("span", { class: "badge bad", text: t("keys.stateQuarantined") });
+  if (state === "cooling") return el("span", { class: "badge warn", text: t("keys.stateCooling", { duration: durationText(cooldown) }) });
+  if (state === "in-use") return el("span", { class: "badge ok", text: t("providers.chatgptInUse") });
+  return el("span", { class: "badge", text: t("providers.chatgptStandby") });
+}
+
+/** The one PATCH shape the endpoint takes: a label, a pause flag, or a cooldown cleared now. */
+async function patchOpencodeKey(name, id, change) {
+  await api(`/api/opencode-accounts/${encodeURIComponent(id)}?provider=${encodeURIComponent(name)}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(change),
+  });
+}
+
+/**
+ * The key stored only in the provider's `headers` has no credential id for the endpoint to address
+ * (the router's endpoint reads `credentials` only). Editing it goes through the config save, which
+ * turns it into key 1 as it writes; `apply` edits that one saved entry.
+ */
+function editLegacyKey(name, apply) {
+  return saveProviderKeys(name, (byId, stored) => stored.map((entry, index) => (index === 0 ? apply(entry) : entry)));
+}
+
+async function setOpencodeKeyPaused(name, row, paused) {
+  try {
+    if (row.legacy) await editLegacyKey(name, (entry) => ({ ...entry, paused: paused || undefined }));
+    else await patchOpencodeKey(name, row.id, { paused });
+    await reloadOpencodeKeys(name);
+  } catch (error) { toast(t("common.saveFailed"), true, error.message); }
+}
+
+/** "대기 해제": the key is usable again now instead of at its window's reset. */
+async function clearOpencodeCooldown(name, id) {
+  try {
+    await patchOpencodeKey(name, id, { clearCooldown: true });
+    await reloadOpencodeKeys(name);
+  } catch (error) { toast(t("common.actionFailed"), true, error.message); }
+}
+
+async function renameOpencodeKey(name, row, label) {
+  try {
+    if (row.legacy) await editLegacyKey(name, row, (entry) => ({ ...entry, label }));
+    else await patchOpencodeKey(name, row.id, { label });
+    await reloadOpencodeKeys(name);
+  } catch (error) { toast(t("common.saveFailed"), true, error.message); }
+}
+
+async function removeOpencodeKey(name, row) {
+  if (!confirm(t("keys.removeConfirm", { name: row.label }))) return;
+  try {
+    if (row.legacy) await saveProviderKeys(name, (byId, stored) => []);
+    else await api(`/api/opencode-accounts/${encodeURIComponent(row.id)}?provider=${encodeURIComponent(name)}`, { method: "DELETE" });
+    toast(t("keys.removed"));
+    await reloadOpencodeKeys(name);
+  } catch (error) { toast(t("common.saveFailed"), true, error.message); }
+}
+
+/** The config changed under us (a key added, paused, renamed or removed): re-read it, then draw. */
+async function reloadOpencodeKeys(name) {
+  try { currentConfig = await api("/api/config"); } catch { /* keep the copy on screen */ }
+  if (selectedProviderName === name && providerDetailTab === "accounts") renderProviderDetail();
+}
+
+/**
+ * Draw the key cards. `data` is `GET /api/opencode-accounts` — `{ accounts: [{ id, label?, state,
+ * cooldown_seconds?, at, windows }] }` — or null when this router does not have that endpoint yet
+ * (an older build), in which case the cards still list and edit the keys from the config.
+ */
+function renderOpencodeKeyRows(target, data, name) {
+  const provider = currentConfig && currentConfig.providers && currentConfig.providers[name];
+  if (!provider) return;
+  const rows = keyRowsOf(provider);
+  const live = new Map(((data && Array.isArray(data.accounts)) ? data.accounts : []).filter((account) => account && typeof account.id === "string").map((account) => [account.id, account]));
+  const cards = rows.map((row, index) => {
+    const account = live.get(row.id);
+    const known = Boolean(account);
+    // The state endpoint names "paused" itself; before it exists, the saved flag in the config does.
+    const paused = known ? account.state === "paused" : byIdPaused(name, row.id);
+    const cooling = known && account.state === "cooling";
+    const inUse = known && account.state === "in-use";
+    const actions = [];
+    if (cooling) {
+      const clear = el("button", { class: "btn secondary compact", type: "button", text: t("providers.chatgptClearCooldown") });
+      clear.addEventListener("click", () => void clearOpencodeCooldown(name, row.id));
+      actions.push(clear);
+    }
+    const pause = el("button", { class: "btn secondary compact", type: "button", text: paused ? t("providers.chatgptResume") : t("providers.chatgptPause") });
+    pause.addEventListener("click", () => void setOpencodeKeyPaused(name, row, !paused));
+    const up = el("button", { class: "icon-btn", type: "button", "aria-label": t("keys.moveUp"), title: t("keys.moveUp") }, [svgIcon("0 0 10 6", ["M1 5l4-4 4 4"])]);
+    up.disabled = index === 0;
+    up.addEventListener("click", () => moveProviderKey(name, row, rows, -1));
+    const down = el("button", { class: "icon-btn", type: "button", "aria-label": t("keys.moveDown"), title: t("keys.moveDown") }, [svgIcon("0 0 10 6", ["M1 1l4 4 4-4"])]);
+    down.disabled = index === rows.length - 1;
+    down.addEventListener("click", () => moveProviderKey(name, row, rows, 1));
+    const rename = el("button", { class: "btn secondary compact", type: "button", text: t("common.edit") });
+    rename.addEventListener("click", () => openRenameKeyDialog(name, row, (label) => renameOpencodeKey(name, row, label)));
+    const remove = el("button", { class: "btn danger compact", type: "button", text: t("common.remove") });
+    remove.addEventListener("click", () => void removeOpencodeKey(name, row));
+    actions.push(pause, up, down, rename, remove);
+    const quota = known ? opencodeQuotaText(account.windows) : "";
+    return el("article", { class: `cell account-card${inUse ? " current" : ""}` }, [
+      el("div", { class: "cell-text account-card-copy" }, [
+        el("strong", { text: (account && account.label) || row.label }),
+        el("span", { class: "small mono key-saved", text: t("providers.keySaved") }),
+        row.legacy ? hint(t("keys.legacyHelp")) : null,
+        quota ? el("p", { class: "small account-quota", text: quota }) : null,
+        el("div", { class: "account-card-actions" }, actions),
+      ]),
+      el("div", { class: "account-card-badges" }, [
+        known ? opencodeStateBadge(account) : null,
+      ].filter(Boolean)),
+    ]);
+  });
+  target.replaceChildren(...(cards.length ? cards : [el("div", { class: "account-empty", text: t("keys.empty") })]));
+  const countNode = $("#opencode-key-count");
+  if (countNode) countNode.textContent = t("keys.count", { count: rows.length });
+}
+
+/** A key's saved `paused` flag, straight from the config the page already holds (no header value read). */
+function byIdPaused(name, id) {
+  const provider = currentConfig && currentConfig.providers && currentConfig.providers[name];
+  const entry = ((provider && provider.credentials) || []).find((item) => item && item.id === id);
+  return Boolean(entry && entry.paused);
+}
+
+async function refreshOpencodeKeyPanel(name) {
+  const target = $("#opencode-key-rows");
+  if (!target || selectedProviderName !== name || providerDetailTab !== "accounts") return;
+  const generation = providerDetailGeneration;
+  let data = null;
+  try { data = await api(`/api/opencode-accounts?provider=${encodeURIComponent(name)}`); }
+  catch { /* an older router has no state endpoint yet: the cards still list and edit the keys */ }
+  if (generation !== providerDetailGeneration) return;
+  renderOpencodeKeyRows(target, data, name);
+}
+
+function opencodeKeysPanel(name) {
+  const add = el("button", { class: "cell-button", type: "button", text: t("keys.addAction") });
+  add.addEventListener("click", () => openAddKeyDialog(name));
+  const rows = el("div", { id: "opencode-key-rows", class: "group account-card-list" }, [el("div", { class: "small", text: t("providers.checking") })]);
+  const panel = el("div", { class: "provider-panel" }, [
+    el("section", { class: "section" }, [
+      el("div", { class: "section-head" }, [el("h3", { class: "section-title", text: t("keys.title") }), el("span", { id: "opencode-key-count", class: "small", text: t("keys.count", { count: 0 }) })]),
+      rows,
+      el("div", { class: "group stacked-add" }, [add]),
+      el("p", { class: "group-footer", text: t("keys.subtitle") }),
+    ]),
+  ]);
+  queueMicrotask(() => void refreshOpencodeKeyPanel(name));
+  return panel;
+}
+
 function renderProviderDetail() {
   const detail = $("#provider-detail");
   providerDetailGeneration += 1;
@@ -2438,6 +3167,7 @@ function renderProviderDetail() {
   if (providerDetailTab === "accounts" && provider.type === "anthropic" && provider.auth === "claude-code") content = anthropicAccountsPanel(name, provider);
   else if (providerDetailTab === "accounts" && provider.type === "chatgpt") content = chatgptAccountsPanel(name);
   else if (providerDetailTab === "accounts" && provider.type === "google" && provider.auth === "antigravity") content = googleAccountsPanel(name);
+  else if (providerDetailTab === "accounts" && isOpencodeGoProvider(provider)) content = opencodeKeysPanel(name);
   else if (providerDetailTab === "models") content = providerModelsPanel(name, provider);
   else { providerDetailTab = "overview"; content = providerOverview(name, provider); }
   detail.replaceChildren(back, header, providerTabs(name, provider), content, el("div", { class: "group provider-remove" }, [remove]));
@@ -3085,7 +3815,10 @@ function openProviderForm(options) {
     const extraHeaders = el("textarea", { rows: "2", placeholder: "header-name: value" });
     const additional = Object.entries(currentHeaders).filter(([key]) => key.toLowerCase() !== "x-api-key" && key.toLowerCase() !== "authorization");
     extraHeaders.value = additional.map(([key, value]) => `${key}: ${value}`).join("\n");
-    advancedContent.appendChild(inputRow(t("providers.extraHeaders"), extraHeaders, t("providers.extraHeadersHelp")));
+    // With several keys saved, these headers are part of every key's request (the router merges
+    // them with each key's own auth header), so the note says so instead of leaving it to be found.
+    const hasKeys = Array.isArray(existing && existing.credentials) && existing.credentials.length > 0;
+    advancedContent.appendChild(inputRow(t("providers.extraHeaders"), extraHeaders, hasKeys ? t("providers.extraHeadersKeysHelp") : t("providers.extraHeadersHelp")));
     advancedContent._extraHeaders = extraHeaders;
     // Without a line of its own the model reads Claude Code's system prompt and answers that it is
     // Claude, which is what DeepSeek did before this was offered here too.

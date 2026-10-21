@@ -36,7 +36,8 @@ import { ChatGptAdapter, type ChatGptAccountStatus, type ImageRequest, type Imag
 import { OpenAiCompatibleAdapter } from "./providers/openai/index.ts";
 import { GoogleAdapter, type GoogleAccountStatus } from "./providers/google/index.ts";
 import type { QuotaGroup } from "./providers/google/usage.ts";
-import { OpenCodeUsage, isOpenCodeGo, type OpenCodeWindow } from "./providers/opencode-usage.ts";
+import { OpenCodeUsage, isOpenCodeGo, refusalResetAt, spentWindowReset, type OpenCodeAccountState, type OpenCodeLimit } from "./providers/opencode-usage.ts";
+import { CreditBalances, creditVendor, type CreditLimit } from "./providers/credit-balance.ts";
 import { GrokAdapter } from "./providers/grok/index.ts";
 import type { GrokWindow } from "./providers/grok/usage.ts";
 import { conversationKey, type AnthropicRequest } from "./providers/chatgpt/translate.ts";
@@ -211,6 +212,13 @@ export type ProxyDeps = {
   upstreamPort?: number;
   /** While engaged (a network switch, tether.ts), new model calls wait here instead of starting. */
   hold?: HoldGate;
+  /**
+   * Test seam for the OpenCode Go `/usage` reader. Production uses the global fetch and a five-minute
+   * cache period; a test needs both to be decided by the test rather than by the network and a clock.
+   */
+  opencodeUsage?: { fetch?: (url: string, init?: RequestInit) => Promise<Response>; ttlMs?: number };
+  /** The same seam for the credit-balance reader (sail, OpenRouter), `/api/limits` only. */
+  creditBalance?: { fetch?: (url: string, init?: RequestInit) => Promise<Response>; ttlMs?: number };
 };
 
 export type Stats = {
@@ -247,6 +255,8 @@ export class Proxy {
   readonly claudeModels: ClaudeModelCatalog;
   /** Each OpenCode Go provider's usage windows, for the status bar's limits row (never a key). */
   private readonly opencodeUsage: OpenCodeUsage;
+  /** Each credit-selling provider's remaining balance, for the limits row (never a key). */
+  private readonly creditBalances: CreditBalances;
   private readonly deps: ProxyDeps;
   /**
    * Cooldowns, quarantines and conversation stickiness for provider credentials. In memory: a
@@ -449,11 +459,37 @@ export class Proxy {
     return this.grok(name, cfg).usage();
   }
 
-  /** An OpenCode Go provider's usage windows, for the status bar's limits row. Empty otherwise. */
-  opencodeLimits(name: string): Promise<OpenCodeWindow[]> {
+  /**
+   * An OpenCode Go provider's usage windows, one entry per credential, for the status bar's limits
+   * row. A provider with no `credentials` keeps the single entry it always had. Empty otherwise.
+   */
+  async opencodeLimits(name: string): Promise<OpenCodeLimit[]> {
     const cfg = this.deps.config().providers[name];
-    if (!cfg || cfg.type !== "openai-compatible" || !isOpenCodeGo(cfg)) return Promise.resolve([]);
-    return this.opencodeUsage.windows(name, cfg.url, cfg.headers ?? {});
+    if (!cfg || cfg.type !== "openai-compatible" || !isOpenCodeGo(cfg)) return [];
+    const credentials = this.credentialsOf(name, cfg);
+    // One lookup per key, and the usage reader caches per account: two keys of the same provider
+    // have separate quotas, so keying the cache on the provider alone would show one key's numbers
+    // under every entry.
+    return Promise.all(credentials.map(async (credential) => ({
+      id: credential.id,
+      ...(credential.label ? { label: credential.label } : {}),
+      windows: await this.opencodeUsage.windows(`${name}/${credential.id}`, cfg.url, credential.headers),
+    })));
+  }
+
+  /**
+   * A credit-selling provider's remaining balance, for the status bar's limits row, or null when
+   * this provider sells no credit. Only the first credential's headers are sent: a balance belongs
+   * to the account, and the other keys of one provider read the same one.
+   */
+  async creditLimit(name: string): Promise<CreditLimit | null> {
+    const cfg = this.deps.config().providers[name];
+    if (!cfg) return null;
+    const vendor = creditVendor(cfg);
+    if (!vendor) return null;
+    const headers = this.credentialsOf(name, cfg)[0]?.headers ?? {};
+    const balance = await this.creditBalances.balance(name, vendor, headers);
+    return balance ? { credit: balance, at: this.creditBalances.readAt(name) } : null;
   }
 
   /** Dashboard action: put one resting Google account back into rotation now. */
@@ -488,7 +524,16 @@ export class Proxy {
       upstream: () => this.deps.config().upstream,
       warn: (message) => deps.log.warn(message),
     });
-    this.opencodeUsage = new OpenCodeUsage({ warn: (message) => deps.log.warn(message) });
+    this.opencodeUsage = new OpenCodeUsage({
+      warn: (message) => deps.log.warn(message),
+      ...(deps.opencodeUsage?.fetch ? { fetch: deps.opencodeUsage.fetch } : {}),
+      ...(deps.opencodeUsage?.ttlMs !== undefined ? { ttlMs: deps.opencodeUsage.ttlMs } : {}),
+    });
+    this.creditBalances = new CreditBalances({
+      warn: (message) => deps.log.warn(message),
+      ...(deps.creditBalance?.fetch ? { fetch: deps.creditBalance.fetch } : {}),
+      ...(deps.creditBalance?.ttlMs !== undefined ? { ttlMs: deps.creditBalance.ttlMs } : {}),
+    });
     this.httpServer = http.createServer({ maxHeaderSize: 64 * 1024 }, (req, res) => {
       void this.handle(req, res);
     });
@@ -972,13 +1017,74 @@ export class Proxy {
           const routeEffort = effortOf(json);
           if (routeEffort) record.effort = routeEffort;
           tag = `OPENAI ${route.tag} wire=${provider.wire ?? "chat"} effort=${routeEffort ?? "-"}`;
+          // Which key answers this turn. The conversation keeps the one it is on while that one is
+          // healthy, because moving it moves the prompt cache with it (§4); with nothing usable the
+          // first configured one is still sent, so the provider — not an empty header set — refuses.
+          const credentials = this.credentialsOf(route.provider, provider);
+          const providerName = route.provider;
+          // Every key paused is the operator's decision, not a failure, so there is no key to send
+          // the turn on — falling back to the first one would quietly use a key the dashboard says is
+          // out of rotation. Answered here instead, retryable, the way a draining router answers.
+          // Cooling keys are different: the turn still goes out on the first one, as before.
+          if (!path.startsWith("/v1/messages/count_tokens") && credentials.length > 0 && credentials.every((credential) => credential.paused)) {
+            const message = isOpenCodeGo(provider) ? "every OpenCode Go key is paused" : `every key of ${providerName} is paused`;
+            const out = JSON.stringify({ type: "error", error: { type: "overloaded_error", message } });
+            res.writeHead(503, { "content-type": "application/json", "content-length": String(Buffer.byteLength(out)) }).end(out);
+            finish("503", Buffer.byteLength(out), message, true, { ...(!searchAttempted ? { upstreamCalled: false as const } : {}) });
+            return;
+          }
+          // A key whose 5-hour, weekly or monthly window is already full is out of rotation until that
+          // window resets, the way a ChatGPT account at 100% is. This reads the usage cache only —
+          // never fetches on the request path — so an empty cache simply means "nothing known yet".
+          this.parkSpentOpenCodeKeys(providerName, provider, credentials);
+          const conversation = conversationKey(json as AnthropicRequest);
+          const first = this.pool.pick(providerName, credentials, conversation) ?? credentials[0]!;
+          const triedKeys = new Set<string>([first.id]);
+          // The key the attempt in flight is on, so a failure is charged to the key that produced it
+          // rather than to the one the turn happened to start on.
+          let charging = first;
           try {
-            const o = await this.openai(route.provider, provider).handle(req, res, path, json as unknown as AnthropicRequest, route.model, routeEffort);
-            this.recordOutcome(route.provider, o.status);
-            if (!path.startsWith("/v1/messages/count_tokens")) this.providerHealth.observe(route.provider, o.status, o.exhaustion);
+            const o = await this.openai(route.provider, provider).handle(req, res, path, json as unknown as AnthropicRequest, route.model, routeEffort, {
+              credential: first,
+              // Nothing has been written to the client when this is asked, so a refused key can be
+              // replaced inside the same turn (the adapter re-asks before its first byte). A failure
+              // that is the request's own fault is not retried at all — `classify` decides, as it does
+              // for the anthropic-compatible wire.
+              next: async (status, text, headers) => {
+                if (res.headersSent) return null;
+                if (!classify(status, undefined, text).retryable) return null;
+                const rest = credentials.filter((credential) => !triedKeys.has(credential.id));
+                // A vendor that states when the key comes back is believed over the pool's default;
+                // that is a cooling time, not a failure, so it is set rather than added to.
+                const spent = await this.refusedUntil(providerName, provider, charging, status, text, headers);
+                if (spent !== undefined) this.pool.coolUntil(providerName, charging.id, spent);
+                // Charged here so the key that just refused is cooling when the next one is picked.
+                // With nothing left to try the turn ends instead, and `recordOutcome` charges it —
+                // twice on one failure would stretch a vendor's cooldown. The vendor's own reset and
+                // body travel with it: a 429 whose `retry-after` says an hour must not cool for the
+                // default minute, and a relay's 403 says what it is about in its body.
+                else if (rest.length > 0) this.pool.penalise(providerName, charging.id, status, retryAfterMs(headers), text);
+                if (rest.length === 0) return null;
+                const next = this.pool.pick(providerName, rest, conversation);
+                if (next) {
+                  triedKeys.add(next.id);
+                  charging = next;
+                }
+                return next;
+              },
+            });
+            // Charged to the key that actually answered, not to the one the turn started on. The
+            // vendor's own reset and body go with it, so this terminal charge reaches the same
+            // verdict as the mid-turn one (a stated 429 reset, a relay 403 that is not about the key).
+            // `count_tokens` is answered locally without naming a key, so it is charged to nobody:
+            // a local 200 must not `succeed` either, or it would lift a quarantine it never earned.
+            if (!path.startsWith("/v1/messages/count_tokens")) {
+              this.recordOutcome(providerName, o.status, o.credentialId ?? first.id, o.vendorRefusal?.retryAfterMs, o.vendorRefusal?.body);
+              this.providerHealth.observe(providerName, o.status, o.exhaustion);
+            }
             finish(String(o.status), o.bytes, o.note, o.status >= 400, { ...o, ...(searchAttempted ? { upstreamCalled: undefined } : {}) });
           } catch (e) {
-            this.recordOutcome(route.provider, 0);
+            this.recordOutcome(providerName, 0, charging.id);
             finish("-", 0, `openai error ${(e as NodeJS.ErrnoException).code ?? ""} ${(e as Error).message}`);
             if (!res.headersSent) res.writeHead(502, { "content-type": "application/json" }).end(JSON.stringify({ type: "error", error: { type: "api_error", message: (e as Error).message } }));
             else res.destroy();
@@ -1698,16 +1804,129 @@ export class Proxy {
   }
 
   /**
-   * Tell the pool how a translated provider's turn went. These adapters hold their own credential —
-   * an OAuth grant, or configured headers — so there is one of it, but the pool still has to hear
-   * about the result or `hasUsable` says yes forever and a slot can never fail over away.
+   * Tell the pool how a translated provider's turn went, for the credential that produced it. These
+   * adapters hold one credential at a time — an OAuth grant, configured headers, or one key of an
+   * openai-compatible pool — but the pool still has to hear about the result or `hasUsable` says yes
+   * forever and a slot can never fail over away.
    *
-   * A status of 0 means the attempt threw before an answer, which is a connect failure.
+   * A status of 0 means the attempt threw before an answer, which is a connect failure. `id` is the
+   * credential the turn ended on; absent, this is the single-credential providers' fixed id.
+   *
+   * `retryAfterMs` and `body` are the vendor's own account of a refusal, when there is one: without
+   * them a 429 stating an hour, or a relay's 403 naming its own broken upstream, was judged as if it
+   * had said nothing at all.
    */
-  private recordOutcome(provider: string, status: number): void {
-    const id = "default";
-    if (status >= 400 || status === 0) this.pool.penalise(provider, id, status);
+  private recordOutcome(provider: string, status: number, id = "default", retryAfterMs?: number, body?: string): void {
+    if (status >= 400 || status === 0) this.pool.penalise(provider, id, status, retryAfterMs, body);
     else if (status > 0) this.pool.succeed(provider, id);
+  }
+
+  /**
+   * Park every OpenCode Go key whose last usage snapshot shows a full window (5-hour, weekly or
+   * monthly) until that window resets — the same rule a ChatGPT account at 100% follows, so a key
+   * that is spent is never picked for a new conversation. Only the cached snapshot is read: this is
+   * the request path, and a turn must not wait on a second request. The cache is refreshed in the
+   * background at the reader's own pace (a few minutes), and an answer that arrives later is applied
+   * then, before the next turn picks a key.
+   */
+  private parkSpentOpenCodeKeys(name: string, provider: { type: string; url?: string; preset?: string }, credentials: readonly Credential[]): void {
+    if (!isOpenCodeGo(provider) || typeof provider.url !== "string") return;
+    const url = provider.url;
+    for (const credential of credentials) {
+      if (credential.paused) continue;
+      const key = `${name}/${credential.id}`;
+      const known = this.opencodeUsage.peek(key);
+      const until = known ? spentWindowReset(known, Date.now()) : null;
+      if (until) this.pool.coolUntil(name, credential.id, until);
+      void this.opencodeUsage.windows(key, url, credential.headers).then((windows) => {
+        const reset = spentWindowReset(windows, Date.now());
+        if (reset) this.pool.coolUntil(name, credential.id, reset);
+      }).catch(() => { /* the reader keeps its last answer and logs the status itself */ });
+    }
+  }
+
+  /**
+   * When a key the vendor just refused may be used again, or undefined to let the pool's own
+   * `classify` decide. OpenCode Go is the only provider here whose refusal states a quota window,
+   * so for everything else this is not its business.
+   *
+   * A stated reset wins: `retry-after`, or a reset field in the body. OpenCode's console proxies the
+   * inference backend's response through unchanged, so the 429 body is the backend's and no single
+   * shape is documented — `refusalResetAt` reads the fields vendors actually use instead of assuming
+   * one. With nothing stated the cached snapshot is worthless here (it is the one that said this key
+   * was fine), so the key's usage is read once more and the full window's own reset is used. Only
+   * then does the pool's default for a rate limit apply.
+   */
+  private async refusedUntil(
+    name: string,
+    provider: { type: string; url?: string; preset?: string },
+    credential: Credential,
+    status: number,
+    text: string,
+    headers: Record<string, string>,
+  ): Promise<number | undefined> {
+    if (status !== 429 || !isOpenCodeGo(provider) || typeof provider.url !== "string") return undefined;
+    const now = Date.now();
+    const stated = refusalResetAt(text, now, retryAfterMs(headers));
+    if (stated !== undefined) return stated;
+    const windows = await this.opencodeUsage.refresh(`${name}/${credential.id}`, provider.url, credential.headers);
+    const reset = spentWindowReset(windows, Date.now());
+    if (reset !== null) return reset;
+    return Date.now() + 60_000;
+  }
+
+  /** Operator action: give one credential another chance now (the dashboard's "다시 사용"). */
+  credentialClear(provider: string, id: string): void {
+    this.pool.clear(provider, id);
+  }
+
+  /**
+   * One OpenCode Go provider's keys as the dashboard's account cards show them, in configured order:
+   * id, label, state and windows — never a header, which is what carries the key.
+   *
+   * "in-use" is the key a new conversation would go to right now (the first usable one, because the
+   * list order is the priority), so after a window resets it is key 1 again without anything having
+   * to move a conversation back.
+   *
+   * A read that fails keeps the last good windows (the reader never blanks them), and a key whose
+   * usage has never been read is `unknown` rather than "standby": the dashboard must not present a
+   * key it knows nothing about as one that is fine.
+   */
+  async opencodeAccounts(name: string): Promise<OpenCodeAccountState[]> {
+    const cfg = this.deps.config().providers[name];
+    if (!cfg || cfg.type !== "openai-compatible" || !isOpenCodeGo(cfg)) return [];
+    const credentials = this.credentialsOf(name, cfg);
+    // Read every key's usage before deciding states: this is the dashboard, where waiting for the
+    // answer is the point, and the snapshots it fills are what the request path then reads.
+    const windows = await Promise.all(credentials.map((credential) =>
+      this.opencodeUsage.windows(`${name}/${credential.id}`, cfg.url, credential.headers)));
+    // Park from the answer just read rather than starting a second lookup per key: the dashboard
+    // already waited for this one, and a background read of the same key would only race it.
+    const now = Date.now();
+    credentials.forEach((credential, index) => {
+      if (credential.paused) return;
+      const reset = spentWindowReset(windows[index]!, now);
+      if (reset !== null) this.pool.coolUntil(name, credential.id, reset);
+    });
+    const chosen = this.pool.pick(name, credentials);
+    const reports = this.pool.report(name, credentials);
+    return credentials.map((credential, index) => {
+      const report = reports[index]!;
+      const readAt = this.opencodeUsage.readAt(`${name}/${credential.id}`);
+      const state: OpenCodeAccountState["state"] = report.state === "paused" || report.state === "quarantined"
+        ? report.state
+        : report.state === "cooling" ? "cooling"
+        : readAt === 0 ? "unknown" // never read: nothing has been said about this key yet
+        : chosen?.id === credential.id ? "in-use" : "standby";
+      return {
+        id: credential.id,
+        ...(credential.label ? { label: credential.label } : {}),
+        state,
+        ...(report.cooldownSeconds !== undefined ? { cooldown_seconds: report.cooldownSeconds } : {}),
+        at: readAt,
+        windows: windows[index]!,
+      };
+    });
   }
 
   /**

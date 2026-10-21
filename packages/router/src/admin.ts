@@ -66,7 +66,8 @@ import { readChatGptAccounts, removeChatGptAccount, summarize as summarizeChatGp
 import { exhaustedForMs, IMAGE_ASPECTS, IMAGE_BACKGROUNDS, IMAGE_FORMATS, type ChatGptAccountStatus, type ImageRequest, type ImageResult } from "./providers/chatgpt/index.ts";
 import type { GoogleAccountStatus } from "./providers/google/index.ts";
 import { googleWindowsFromGroups, type QuotaGroup } from "./providers/google/usage.ts";
-import { isOpenCodeGo, type OpenCodeWindow } from "./providers/opencode-usage.ts";
+import { isOpenCodeGo, type OpenCodeAccountState, type OpenCodeLimit } from "./providers/opencode-usage.ts";
+import type { CreditBalance, CreditLimit } from "./providers/credit-balance.ts";
 import type { GrokWindow } from "./providers/grok/usage.ts";
 import { ANTIGRAVITY_WARNING, staticAntigravityModels } from "./providers/google/antigravity.ts";
 import { readGoogleAccounts, removeGoogleAccount, summarize as summarizeGoogleAccount, updateGoogleAccount } from "./providers/google/accounts.ts";
@@ -181,8 +182,20 @@ export type AdminDeps = {
   claudeUsage?: () => Promise<Record<string, Record<string, unknown>>>;
   /** The Claude models the signed-in account can use (`GET /v1/models`); null until one answer. Absent in tests. */
   claudeModels?: () => Promise<ClaudeModel[] | null>;
-  /** An OpenCode Go provider's usage windows, for the status bar's limits row (`/api/limits`). Absent in tests. */
-  opencodeUsage?: (name: string) => Promise<OpenCodeWindow[]>;
+  /**
+   * A credit-selling provider's remaining balance, for the status bar's limits row (`/api/limits`),
+   * or null when it has none. Absent in tests.
+   */
+  creditBalance?: (name: string) => Promise<CreditLimit | null>;
+  /** An OpenCode Go provider's usage per key, for the status bar's limits row (`/api/limits`). Absent in tests. */
+  opencodeUsage?: (name: string) => Promise<OpenCodeLimit[]>;
+  /**
+   * Each OpenCode Go key as an account card for `GET /api/opencode-accounts` (state, cooldown,
+   * windows; ids and labels only). Absent in tests.
+   */
+  opencodeAccounts?: (name: string) => Promise<OpenCodeAccountState[]>;
+  /** Put one provider credential back into rotation now (`PATCH /api/opencode-accounts/:id`). */
+  credentialClear?: (provider: string, id: string) => void;
   /** A Grok provider's usage pool, for the status bar's limits row (`/api/limits`). Absent in tests. */
   grokUsage?: (name: string) => Promise<GrokWindow[]>;
   /**
@@ -231,7 +244,22 @@ async function claudeAccountUsage(deps: AdminDeps): Promise<{ id: string; label:
 
 /** One window the limits row reads. `reset_at` is epoch seconds, as the other readers use. */
 export type LimitsWindow = { kind: "five_hour" | "seven_day" | "scoped" | "window"; label?: string; used_percent: number; window_minutes?: number; reset_at?: number };
-export type LimitsAccount = { account: number; windows: LimitsWindow[]; at: number };
+/**
+ * One account row. `label` is the provider's own name for the account, when it has one (OpenCode Go
+ * keys). `credit` is a prepaid balance instead of windows (providers that sell credit, not quota).
+ */
+export type LimitsAccount = {
+  account: number;
+  label?: string;
+  windows: LimitsWindow[];
+  at: number;
+  /**
+   * The subscription's renewal date, epoch seconds, when the provider states one (ChatGPT: the id
+   * token's `chatgpt_subscription_active_until`). Absent for providers that do not.
+   */
+  renews_at?: number;
+  credit?: CreditBalance;
+};
 export type LimitsProvider = { provider: string; type: string; title: string; accounts: LimitsAccount[] };
 
 /** A `{used_percent, window_minutes, reset_at}` snapshot window as `/api/limits` reads it, or null. */
@@ -300,7 +328,7 @@ function chatgptLimitAccounts(accounts: ChatGptAccountStatus[]): LimitsAccount[]
       const win = limitWindowFrom(w);
       if (win) windows.push({ kind: windowKind(win.window_minutes), used_percent: win.used_percent, ...(win.window_minutes !== undefined ? { window_minutes: win.window_minutes } : {}), ...(win.reset_at !== undefined ? { reset_at: win.reset_at } : {}) });
     }
-    if (windows.length) out.push({ account: index, windows, at: quota.at });
+    if (windows.length) out.push({ account: index, windows, at: quota.at, ...(account.renewsAt !== undefined ? { renews_at: Math.round(account.renewsAt / 1000) } : {}) });
   });
   return out;
 }
@@ -328,6 +356,70 @@ async function googleLimitAccounts(deps: AdminDeps, name: string): Promise<Limit
   return out;
 }
 
+/**
+ * The OpenCode Go provider an account-card request names, or null when there is none. The query
+ * `provider` picks one; absent, the first OpenCode Go provider in config order is used, the same
+ * fallback `/api/chatgpt-accounts` uses.
+ */
+function opencodeProviderName(deps: AdminDeps, wanted: string | null): string | null {
+  const providers = deps.config().providers;
+  if (wanted) {
+    const p = providers[wanted];
+    return p && p.type === "openai-compatible" && isOpenCodeGo(p) ? wanted : null;
+  }
+  for (const [name, p] of Object.entries(providers)) {
+    if (p.type === "openai-compatible" && isOpenCodeGo(p)) return name;
+  }
+  return null;
+}
+
+/**
+ * Rename, pause/resume or remove one key in a provider's `credentials`.
+ *
+ * The config is read again rather than reusing the in-memory copy, and written through the one
+ * atomic save path, because the router picks a config file up by mtime: writing back a stale copy
+ * would silently revert a save the user made from another screen while this request was running.
+ * The result is validated with the same `validate` the GUI's save uses, so a bad edit is refused
+ * rather than written.
+ *
+ * Removing the last key is allowed: the provider then has no `credentials` and falls back to its
+ * single `headers` key, which is the state every provider starts in.
+ */
+function changeOpencodeKey(
+  deps: AdminDeps,
+  name: string,
+  id: string,
+  change: { label?: string; paused?: boolean; remove?: boolean },
+): { ok: true } | { error: string } {
+  let current: Config;
+  try {
+    current = JSON.parse(fs.readFileSync(deps.configFile, "utf8")) as Config;
+  } catch (e) {
+    return { error: `could not re-read config: ${errorText(e)}` };
+  }
+  const provider = current.providers[name];
+  if (!provider || provider.type !== "openai-compatible" || !isOpenCodeGo(provider) || !provider.credentials) return { error: "not-found" };
+  const index = provider.credentials.findIndex((credential) => credential.id === id);
+  if (index < 0) return { error: "not-found" };
+  if (change.remove) {
+    provider.credentials.splice(index, 1);
+    if (provider.credentials.length === 0) delete provider.credentials;
+  } else {
+    const credential = provider.credentials[index]!;
+    if (change.label !== undefined) credential.label = change.label;
+    if (change.paused !== undefined) {
+      // Absent rather than `false` when resumed: the stored config then reads the way a never-paused
+      // key does, and a boolean is only ever present when it is meant.
+      if (change.paused) credential.paused = true;
+      else delete credential.paused;
+    }
+  }
+  const errors = validate(current);
+  if (errors.length > 0) return { error: errors[0]! };
+  writeConfigFile(deps.configFile, current);
+  return { ok: true };
+}
+
 /** Every provider whose quota can be read, in one shape, for `GET /api/limits`. */
 async function buildLimits(deps: AdminDeps): Promise<{ providers: LimitsProvider[] }> {
   const providers: LimitsProvider[] = [];
@@ -335,6 +427,13 @@ async function buildLimits(deps: AdminDeps): Promise<{ providers: LimitsProvider
   const accounts = chatgpt?.accounts?.() ?? {};
   for (const [name, p] of Object.entries(deps.config().providers)) {
     if (p.limits === false) continue;
+    // A provider that sells prepaid credit reports that instead of quota windows, whichever wire it
+    // speaks (sail on OpenRouter's anthropic-compatible one, an OpenRouter key on either).
+    const credit = deps.creditBalance ? await deps.creditBalance(name) : null;
+    if (credit) {
+      providers.push({ provider: name, type: "credit", title: name, accounts: [{ account: 0, windows: [], at: credit.at, credit: credit.credit }] });
+      continue;
+    }
     if (p.type === "anthropic" && p.auth === "claude-code") {
       const rows = await anthropicLimitAccounts(deps);
       if (rows.length) providers.push({ provider: name, type: "anthropic", title: "Claude", accounts: rows });
@@ -345,8 +444,16 @@ async function buildLimits(deps: AdminDeps): Promise<{ providers: LimitsProvider
       const rows = await googleLimitAccounts(deps, name);
       if (rows.length) providers.push({ provider: name, type: "google", title: "Gemini", accounts: rows });
     } else if (p.type === "openai-compatible" && isOpenCodeGo(p)) {
-      const windows = (await deps.opencodeUsage?.(name)) ?? [];
-      if (windows.length) providers.push({ provider: name, type: "opencode-go", title: "Go", accounts: [{ account: 0, windows: windows.map((w) => ({ ...w })), at: Date.now() }] });
+      const keys = (await deps.opencodeUsage?.(name)) ?? [];
+      // One account per key, in configured order; a provider with no `credentials` reports the single
+      // entry it always had. A key with no readable windows is left out rather than shown empty.
+      const at = Date.now();
+      const rows: LimitsAccount[] = [];
+      keys.forEach((key, index) => {
+        if (!key.windows.length) return;
+        rows.push({ account: index, ...(key.label ? { label: key.label } : {}), windows: key.windows.map((w) => ({ ...w })), at });
+      });
+      if (rows.length) providers.push({ provider: name, type: "opencode-go", title: "Go", accounts: rows });
     } else if (p.type === "grok") {
       const windows = (await deps.grokUsage?.(name)) ?? [];
       if (windows.length) providers.push({ provider: name, type: "grok", title: "Grok", accounts: [{ account: 0, windows: windows.map((w) => ({ ...w })), at: Date.now() }] });
@@ -1939,6 +2046,68 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
       // One shape for every provider whose quota can be read, for the status bar's limits row.
       if (pathname === "/api/limits" && method === "GET") {
         sendJson(res, 200, await buildLimits(deps));
+        return;
+      }
+      // One OpenCode Go provider's keys as account cards (state, cooldown, windows). Ids and labels
+      // only: the headers that carry a key are never rendered or logged here. (They are still part
+      // of the provider config this router serves, as they always have been — `GET /api/config`.)
+      if (pathname === "/api/opencode-accounts" && method === "GET") {
+        const wanted = new URL(url, "http://127.0.0.1").searchParams.get("provider");
+        const name = opencodeProviderName(deps, wanted);
+        if (!name) {
+          sendJson(res, 404, { error: "no OpenCode Go provider by that name" });
+          return;
+        }
+        sendJson(res, 200, { provider: name, accounts: (await deps.opencodeAccounts?.(name)) ?? [] });
+        return;
+      }
+      if (pathname.startsWith("/api/opencode-accounts/") && (method === "PATCH" || method === "DELETE")) {
+        let id: string;
+        try {
+          id = decodeURIComponent(pathname.slice("/api/opencode-accounts/".length));
+        } catch {
+          sendJson(res, 400, { error: "invalid key id" });
+          return;
+        }
+        const name = opencodeProviderName(deps, new URL(url, "http://127.0.0.1").searchParams.get("provider"));
+        if (!name) {
+          sendJson(res, 404, { error: "no OpenCode Go provider by that name" });
+          return;
+        }
+        if (method === "DELETE") {
+          const result = changeOpencodeKey(deps, name, id, { remove: true });
+          if ("error" in result) {
+            sendJson(res, result.error === "not-found" ? 404 : 400, { error: result.error === "not-found" ? "key not found" : result.error });
+            return;
+          }
+          deps.log.info(`admin: removed OpenCode Go key ${id} from ${name}`);
+          sendJson(res, 200, { ok: true });
+          return;
+        }
+        let change: { label?: unknown; paused?: unknown; clearCooldown?: unknown };
+        try {
+          change = JSON.parse((await readBody(req)).toString("utf8")) as typeof change;
+        } catch {
+          sendJson(res, 400, { error: "invalid JSON" });
+          return;
+        }
+        if ((change.label !== undefined && (typeof change.label !== "string" || !change.label.trim())) || (change.paused !== undefined && typeof change.paused !== "boolean")) {
+          sendJson(res, 400, { error: "expected {label?: non-empty string, paused?: boolean, clearCooldown?: true}" });
+          return;
+        }
+        if (change.clearCooldown === true) deps.credentialClear?.(name, id);
+        if (change.label !== undefined || change.paused !== undefined) {
+          const result = changeOpencodeKey(deps, name, id, {
+            ...(typeof change.label === "string" ? { label: change.label } : {}),
+            ...(typeof change.paused === "boolean" ? { paused: change.paused } : {}),
+          });
+          if ("error" in result) {
+            sendJson(res, result.error === "not-found" ? 404 : 400, { error: result.error === "not-found" ? "key not found" : result.error });
+            return;
+          }
+        }
+        deps.log.info(`admin: updated OpenCode Go key ${id} on ${name}`);
+        sendJson(res, 200, { ok: true });
         return;
       }
       if (pathname === "/api/mod-settings" && method === "GET") {

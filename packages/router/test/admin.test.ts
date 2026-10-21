@@ -44,6 +44,9 @@ async function withAdmin(
     chatgpt?: NonNullable<AdminDeps["chatgpt"]>;
     google?: NonNullable<AdminDeps["google"]>;
     opencodeUsage?: NonNullable<AdminDeps["opencodeUsage"]>;
+    opencodeAccounts?: NonNullable<AdminDeps["opencodeAccounts"]>;
+    creditBalance?: NonNullable<AdminDeps["creditBalance"]>;
+    credentialClear?: NonNullable<AdminDeps["credentialClear"]>;
     claudeUsage?: NonNullable<AdminDeps["claudeUsage"]>;
     googleOAuthFetch?: (url: string, init?: RequestInit) => Promise<Response>;
     googleOAuthPort?: number;
@@ -2429,13 +2432,15 @@ test("GET /api/limits assembles every readable provider and honours limits:false
   } });
   await withAdmin(cfg, async ({ port }) => {
     const res = await fetch(`${base()}:${port}/api/limits`);
-    const body = (await res.json()) as { providers: { provider: string; type: string; title: string; accounts: { account: number; windows: { kind: string; label?: string; used_percent: number }[] }[] }[] };
+    const body = (await res.json()) as { providers: { provider: string; type: string; title: string; accounts: { account: number; windows: { kind: string; label?: string; used_percent: number }[]; renews_at?: number }[] }[] };
     assert.deepEqual(body.providers.map((p) => p.provider), ["anthropic", "chatgpt", "gem", "go"]);
     assert.deepEqual(body.providers.map((p) => p.title), ["Claude", "GPT", "Gemini", "Go"]);
     assert.equal(body.providers[0]!.type, "anthropic");
     assert.deepEqual(body.providers[0]!.accounts[0]!.windows.map((w) => `${w.kind}${w.label ? ":" + w.label : ""}`), ["five_hour", "seven_day", "scoped:Fable"]);
     // The paused ChatGPT account takes no number; the ready one is account 0.
     assert.deepEqual(body.providers[1]!.accounts.map((a) => a.account), [0]);
+    // The subscription's renewal date is carried in epoch seconds, when the account states one.
+    assert.equal(body.providers[1]!.accounts[0]!.renews_at, Math.round((now + 7 * 86_400_000) / 1000));
     assert.equal(body.providers[2]!.type, "google");
     assert.equal(body.providers[3]!.type, "opencode-go");
   }, {
@@ -2447,7 +2452,7 @@ test("GET /api/limits assembles every readable provider and honours limits:false
       quota: {}, auth: {},
       accounts: () => ({
         chatgpt: [
-          { id: "a", label: "A", paused: false, state: "ready", quota: { at: now, rate_limits: { primary: { used_percent: 23, window_minutes: 10080, reset_at: future }, secondary: null } }, active: true },
+          { id: "a", label: "A", paused: false, state: "ready", quota: { at: now, rate_limits: { primary: { used_percent: 23, window_minutes: 10080, reset_at: future }, secondary: null } }, active: true, renewsAt: now + 7 * 86_400_000 },
           { id: "b", label: "B", paused: true, state: "paused", quota: null, active: false },
         ] as never,
         quiet: [{ id: "c", label: "C", paused: false, state: "ready", quota: { at: now, rate_limits: { primary: { used_percent: 5, window_minutes: 10080 } } }, active: false }] as never,
@@ -2460,10 +2465,156 @@ test("GET /api/limits assembles every readable provider and honours limits:false
         { bucketId: "gemini-5h", displayName: "5h", window: "5h", remainingFraction: 1 },
       ] }] }),
     }),
-    opencodeUsage: async (name: string) => name === "go" ? [
-      { kind: "five_hour", used_percent: 3, window_minutes: 300, reset_at: future },
-      { kind: "seven_day", used_percent: 52, window_minutes: 10080, reset_at: future },
-      { kind: "window", used_percent: 92, window_minutes: 43200, reset_at: future },
-    ] : [],
+    opencodeUsage: async (name: string) => name === "go" ? [{
+      id: "default",
+      windows: [
+        { kind: "five_hour", used_percent: 3, window_minutes: 300, reset_at: future },
+        { kind: "seven_day", used_percent: 52, window_minutes: 10080, reset_at: future },
+        { kind: "window", used_percent: 92, window_minutes: 43200, reset_at: future },
+      ],
+    }] : [],
   });
+});
+
+test("GET /api/limits reports a credit-selling provider as a credit row, and honours limits:false", async () => {
+  const now = Date.now();
+  const cfg = makeCfg({ providers: {
+    sail: { type: "anthropic-compatible", url: "https://api.sailresearch.com/anthropic" },
+    or: { type: "anthropic-compatible", url: "https://openrouter.ai/api" },
+    quiet: { type: "anthropic-compatible", url: "https://api.sailresearch.com/anthropic", limits: false },
+    deepseek: { type: "anthropic-compatible", url: "https://api.deepseek.com/anthropic" },
+  } });
+  await withAdmin(cfg, async ({ port }) => {
+    const res = await fetch(`${base()}:${port}/api/limits`);
+    const body = (await res.json()) as { providers: { provider: string; type: string; title: string; accounts: { account: number; windows: unknown[]; at: number; credit?: { remaining_usd: number; days_remaining?: number; low: boolean } }[] }[] };
+    assert.deepEqual(body.providers.map((p) => [p.provider, p.type]), [["sail", "credit"], ["or", "credit"]]);
+    const sail = body.providers[0]!;
+    assert.equal(sail.title, "sail");
+    // The contract the UI tile reads: one account, no windows, the balance and when it was read.
+    assert.deepEqual(sail.accounts[0]!.windows, []);
+    assert.equal(sail.accounts[0]!.at, now);
+    assert.deepEqual(sail.accounts[0]!.credit, { remaining_usd: 737.95, days_remaining: 12.3, low: false });
+    assert.deepEqual(body.providers[1]!.accounts[0]!.credit, { remaining_usd: 2.5, low: true });
+  }, {
+    creditBalance: async (name: string) => name === "sail"
+      ? { credit: { remaining_usd: 737.95, days_remaining: 12.3, low: false }, at: now }
+      : name === "or" ? { credit: { remaining_usd: 2.5, low: true }, at: now } : null,
+  });
+});
+
+test("GET /api/limits lists one OpenCode Go account per key, labelled when the key has a label", async () => {
+  const now = Date.now();
+  const window = { kind: "five_hour" as const, used_percent: 30, window_minutes: 300, reset_at: Math.floor(now / 1000) + 600 };
+  const cfg = makeCfg({ providers: {
+    go: {
+      type: "openai-compatible", preset: "opencode-go", url: "https://opencode.ai/zen/go/v1",
+      credentials: [
+        { id: "k1", label: "Work", headers: { authorization: "Bearer test-key-1" } },
+        { id: "k2", headers: { authorization: "Bearer test-key-2" } },
+      ],
+    },
+  } });
+  await withAdmin(cfg, async ({ port }) => {
+    const res = await fetch(`${base()}:${port}/api/limits`);
+    const body = (await res.json()) as { providers: { accounts: { account: number; label?: string; windows: { used_percent: number }[]; at: number }[] }[] };
+    const accounts = body.providers[0]!.accounts;
+    assert.deepEqual(accounts.map((a) => [a.account, a.label]), [[0, "Work"], [1, undefined]]);
+    assert.deepEqual(accounts.map((a) => a.windows[0]!.used_percent), [30, 30]);
+  }, {
+    // A key with no readable windows is left out rather than shown empty.
+    opencodeUsage: async () => [
+      { id: "k1", label: "Work", windows: [window] },
+      { id: "k2", windows: [window] },
+      { id: "k3", windows: [] },
+    ],
+  });
+});
+
+test("GET /api/opencode-accounts lists each key's state and windows, and never a header", async () => {
+  const now = Date.now();
+  const cfg = makeCfg({ providers: {
+    go: {
+      type: "openai-compatible", preset: "opencode-go", url: "https://opencode.ai/zen/go/v1",
+      credentials: [
+        { id: "k1", label: "Work", headers: { authorization: "Bearer test-key-1" } },
+        { id: "k2", headers: { authorization: "Bearer test-key-2" }, paused: true },
+      ],
+    },
+  } });
+  await withAdmin(cfg, async ({ port }) => {
+    const res = await fetch(`${base()}:${port}/api/opencode-accounts?provider=go`);
+    assert.equal(res.status, 200);
+    const text = await res.text();
+    assert.ok(!text.includes("test-key-1") && !text.includes("test-key-2"), "no header value is serialised");
+    assert.ok(!/authorization/i.test(text), "not even the header's name");
+    const body = JSON.parse(text) as { provider: string; accounts: { id: string; label?: string; state: string; at: number; windows: { kind: string; used_percent: number }[] }[] };
+    assert.equal(body.provider, "go");
+    assert.deepEqual(body.accounts.map((a) => [a.id, a.label, a.state]), [["k1", "Work", "in-use"], ["k2", undefined, "paused"]]);
+    assert.equal(body.accounts[0]!.windows[0]!.kind, "five_hour");
+    assert.equal(body.accounts[0]!.at, now);
+    // An unknown provider, or a provider that is not OpenCode Go, is a 404 rather than an empty list.
+    assert.equal((await fetch(`${base()}:${port}/api/opencode-accounts?provider=nope`)).status, 404);
+  }, {
+    opencodeAccounts: async () => [
+      { id: "k1", label: "Work", state: "in-use", at: now, windows: [{ kind: "five_hour", used_percent: 40, window_minutes: 300 }] },
+      { id: "k2", state: "paused", at: 0, windows: [] },
+    ],
+  });
+});
+
+test("PATCH and DELETE on an OpenCode Go key change `credentials` on disk, and validate", async () => {
+  let cleared: string[] = [];
+  const cfg = makeCfg({ providers: {
+    go: {
+      type: "openai-compatible", preset: "opencode-go", url: "https://opencode.ai/zen/go/v1",
+      credentials: [
+        { id: "k1", label: "Work", headers: { authorization: "Bearer test-key-1" } },
+        { id: "k2", headers: { authorization: "Bearer test-key-2" } },
+      ],
+    },
+  } });
+  await withAdmin(cfg, async ({ port, configFile }) => {
+    const origin = `http://127.0.0.1:${port}`;
+    const saved = (): { credentials?: { id: string; label?: string; paused?: boolean; headers: Record<string, string> }[] } =>
+      (JSON.parse(fs.readFileSync(configFile, "utf8")) as { providers: { go: { credentials?: { id: string; label?: string; paused?: boolean; headers: Record<string, string> }[] } } }).providers.go;
+
+    // Rename and pause in one save.
+    let res = await fetch(`${base()}:${port}/api/opencode-accounts/k2?provider=go`, {
+      method: "PATCH", headers: { "content-type": "application/json", origin }, body: JSON.stringify({ label: "Home", paused: true }),
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(saved().credentials!.map((c) => [c.id, c.label, c.paused]), [["k1", "Work", undefined], ["k2", "Home", true]]);
+    // The key itself is untouched by a rename or a pause.
+    assert.equal(saved().credentials![1]!.headers.authorization, "Bearer test-key-2");
+
+    // Resume writes no `paused: false`: the file reads the way a never-paused key does.
+    res = await fetch(`${base()}:${port}/api/opencode-accounts/k2?provider=go`, {
+      method: "PATCH", headers: { "content-type": "application/json", origin }, body: JSON.stringify({ paused: false }),
+    });
+    assert.equal(res.status, 200);
+    assert.equal("paused" in saved().credentials![1]!, false);
+
+    // A cooldown is cleared in the router's memory, not by writing the config.
+    res = await fetch(`${base()}:${port}/api/opencode-accounts/k2?provider=go`, {
+      method: "PATCH", headers: { "content-type": "application/json", origin }, body: JSON.stringify({ clearCooldown: true }),
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(cleared, ["go/k2"]);
+
+    // An unknown id is a 404; a bad label is a 400 and changes nothing.
+    assert.equal((await fetch(`${base()}:${port}/api/opencode-accounts/nope?provider=go`, {
+      method: "PATCH", headers: { "content-type": "application/json", origin }, body: JSON.stringify({ paused: true }),
+    })).status, 404);
+    assert.equal((await fetch(`${base()}:${port}/api/opencode-accounts/k1?provider=go`, {
+      method: "PATCH", headers: { "content-type": "application/json", origin }, body: JSON.stringify({ label: "" }),
+    })).status, 400);
+    assert.equal(saved().credentials![0]!.label, "Work");
+
+    // Removing the last key leaves no empty list: the provider falls back to its single `headers` key.
+    for (const id of ["k1", "k2"]) {
+      res = await fetch(`${base()}:${port}/api/opencode-accounts/${id}?provider=go`, { method: "DELETE", headers: { origin } });
+      assert.equal(res.status, 200);
+    }
+    assert.equal(saved().credentials, undefined);
+  }, { credentialClear: (provider, id) => cleared.push(`${provider}/${id}`) });
 });
